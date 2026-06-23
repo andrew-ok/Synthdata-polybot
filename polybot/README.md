@@ -1,0 +1,118 @@
+# polybot — Polymarket × Synth paper-trading scanner
+
+Paper-trading and backtesting first. **No live order placement.**
+
+Compares Synth's probabilistic Up/Down forecast for a Polymarket contract
+against the *actual CLOB best ask* on the matching YES/NO side (never the
+midpoint). Flags trades when Synth's probability exceeds the executable ask by
+at least the edge threshold.
+
+## Install
+
+```bash
+cd /Users/andrewok/Desktop/Synthbot
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r polybot/requirements.txt
+cp polybot/.env.example .env
+# edit .env and set SYNTH_API_KEY
+set -a; source .env; set +a
+```
+
+## Run the scanner
+
+```bash
+python -m polybot.scanner                 # ranked opportunities
+python -m polybot.scanner --show-skipped  # see rejection reasons too
+python -m polybot.scanner --execute       # write paper fills to polybot/logs/
+python -m polybot.scanner --kelly         # fractional-Kelly sizing
+```
+
+## Daily reports
+
+Paper fills are written to `polybot/logs/fills.jsonl`. Daily reports are saved
+under `polybot/logs/reports/` as both Markdown and JSON so they can be read
+back into chat or processed by another tool.
+
+```bash
+python -m polybot.scanner --execute
+python -m polybot.scanner --daily-report
+python -m polybot.scanner --daily-report 2026-06-22
+python -m polybot.scanner --calibration-report
+```
+
+Daily reports use `REPORT_TIMEZONE` and group trades by asset with
+win/loss/open counts. Win/loss requires a fill row to have `resolved_outcome`
+or `realized_pnl`; unresolved paper trades are reported as open.
+
+## Backtest
+
+Historical backtests spend Synth calls: `windows x assets x horizons`.
+For BTC/ETH/SOL/HYPE across 15M+1H, 24h is about 480 calls and 7d is about
+3,360 calls. Runs over `MAX_BACKTEST_CALLS_WITHOUT_CONFIRM` refuse to start
+unless explicitly confirmed, and every completed run is saved to
+`polybot/logs/last_backtest.txt`.
+
+```bash
+python -m polybot.scanner --backtest 2026-06-14T00:00:00Z 2026-06-15T00:00:00Z
+CONFIRM_BACKTEST_SPEND=YES python -m polybot.scanner --backtest 2026-06-08T00:00:00Z 2026-06-15T00:00:00Z
+```
+
+Sweeps thresholds `{0.10, 0.15, 0.20, 0.25, 0.30}` and ranks by Sharpe proxy.
+Synth responses are cached under `polybot/data/synth_cache/` to avoid paying
+again for the same historical window during reruns.
+
+Backtests only use final labels from `resolved_outcome` / `final_outcome` /
+`event_outcome` / `actual_outcome` by default. Set
+`ALLOW_CURRENT_OUTCOME_BACKTEST_LABEL=true` only when you have verified that
+Synth's `current_outcome` field is a final historical label for the endpoint
+being tested.
+
+## Calibration
+
+Historical backtests append observations to
+`polybot/data/calibration/observations.jsonl`. The signal engine uses those
+records to calibrate Synth probabilities per asset and horizon before
+calculating edge:
+
+```text
+calibrated_edge = calibrated_probability - ask
+```
+
+The calibration report saves reliability curves, Brier score, Sharpe, win
+rate, and PnL by segment under `polybot/logs/calibration/`.
+
+## Modules
+
+| File | Responsibility |
+|---|---|
+| `config.py` | env-driven config, defaults, paper-mode lock |
+| `synth_client.py` | Synth API -> normalized `Opportunity` |
+| `polymarket_client.py` | Gamma metadata + CLOB best bid/ask + liquidity |
+| `matcher.py` | legacy strict matcher for standalone Polymarket markets |
+| `signal_engine.py` | calibrated edge, net edge, and EV score per side |
+| `risk_manager.py` | spread/liquidity/correlation gates, sizing |
+| `execution.py` | paper fills with slippage; live trading stubbed |
+| `reports.py` | local Markdown/JSON daily paper-trade reports |
+| `calibration.py` | calibration database, reliability curves, segment metrics |
+| `exit_rules.py` | paper-position exit signal checks |
+| `backtester.py` | threshold sweep, win rate / EV / PnL / DD / Sharpe |
+| `dashboard.py` | CLI table of opportunities + rejection reasons |
+| `scanner.py` | entrypoint |
+
+## Safety rails
+
+- `PAPER_TRADE_MODE=true` is enforced in `execution.paper_fill`.
+- `place_live_limit_order` raises `NotImplementedError`.
+- Marketable orders are blocked unless `ALLOW_MARKETABLE_ORDERS=true`.
+- The fills ledger blocks repeat entries on the same event contract after a
+  position has already been opened.
+- Correlated-event gate prevents stacking multiple markets on the same name.
+- Min-hours-to-resolution avoids last-minute info-risk markets.
+
+## Notes on Synth endpoints
+
+The Synth endpoint paths in `synth_client.py` are best-guess defaults
+(`/v1/polymarket/forecasts`). Adjust the two `SYNTH_*_PATH` constants at the
+top of that file if your Synthdata Pro plan exposes them under a different
+route. The normalizer accepts several common payload shapes
+(`probability` / `p_yes` / `synth_yes_probability`).

@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+polybot/logs/
+polybot/data/
+__pycache__/
+*.pyc
+.venv/
