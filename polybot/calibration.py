@@ -102,10 +102,42 @@ def _bin_members(rows: List[CalibrationObservation], probability: float) -> List
     n_bins = max(2, CONFIG.calibration_bins)
     lo = idx / n_bins
     hi = (idx + 1) / n_bins
+    last_bin = idx == n_bins - 1
     return [
         r for r in rows
-        if lo <= r.predicted_probability < hi or (idx == n_bins - 1 and r.predicted_probability <= hi)
+        if lo <= r.predicted_probability < hi or (last_bin and r.predicted_probability >= lo)
     ]
+
+
+def _bin_members_adaptive(
+    rows: List[CalibrationObservation],
+    probability: float,
+    min_samples: int,
+) -> Tuple[List[CalibrationObservation], str]:
+    """Expand outward from the exact bin until min_samples are found.
+
+    Returns (members, suffix) where suffix is:
+      "bin"          — exact target bin already has enough samples
+      "adaptive_bin" — reached min_samples by expanding to neighboring bins
+      "all"          — full expansion exhausted; returned all rows regardless
+    """
+    n_bins = max(2, CONFIG.calibration_bins)
+    idx = _bin_index(probability)
+
+    for radius in range(n_bins):
+        lo_idx = max(0, idx - radius)
+        hi_idx = min(n_bins - 1, idx + radius)
+        lo = lo_idx / n_bins
+        hi = (hi_idx + 1) / n_bins
+        last_bin = hi_idx == n_bins - 1
+        members = [
+            r for r in rows
+            if lo <= r.predicted_probability < hi or (last_bin and r.predicted_probability >= lo)
+        ]
+        if len(members) >= min_samples:
+            return members, ("bin" if radius == 0 else "adaptive_bin")
+
+    return rows, "all"
 
 
 def _returns(rows: Iterable[CalibrationObservation]) -> List[float]:
@@ -143,9 +175,10 @@ def _bins(rows: List[CalibrationObservation]) -> List[Dict[str, float]]:
     for idx in range(n_bins):
         lo = idx / n_bins
         hi = (idx + 1) / n_bins
+        is_last = idx == n_bins - 1
         members = [
             r for r in rows
-            if lo <= r.predicted_probability < hi or (idx == n_bins - 1 and r.predicted_probability <= hi)
+            if lo <= r.predicted_probability < hi or (is_last and r.predicted_probability >= lo)
         ]
         obs = sum(1 for r in members if r.realized_outcome == "UP")
         count = len(members)
@@ -215,22 +248,47 @@ class Calibrator:
             r for r in self._by_segment.get(_segment_key(asset, horizon), [])
             if r.side.upper() == side
         ]
+        # tier: (method_base, rows, total_gate)
+        # total_gate: minimum total same-side rows needed before this tier is used.
+        # min_calibration_samples_segment and min_calibration_samples_global are
+        # segment-level gates, NOT per-bin requirements. Per-bin/local requirements
+        # use min_calibration_bin_samples, which is much lower.
         candidates = [
             ("asset_horizon_side", self._by_segment_side.get((asset.upper(), horizon, side), []), CONFIG.min_calibration_samples_segment),
             ("asset_horizon_same_side", seg_same_side, CONFIG.min_calibration_samples_segment),
             ("global_same_side", self._global_by_side.get(side, []), CONFIG.min_calibration_samples_global),
         ]
-        for method, rows, min_samples in candidates:
-            members = _bin_members(rows, p)
-            if len(members) < min_samples:
+        bin_min = CONFIG.min_calibration_bin_samples
+        for tier_base, rows, total_gate in candidates:
+            if len(rows) < total_gate:
                 continue
+            # Try exact bin first, then expand to neighboring bins.
+            local_members, bin_suffix = _bin_members_adaptive(rows, p, bin_min)
+            local_satisfied = len(local_members) >= bin_min
+            if local_satisfied:
+                members = local_members
+                method = f"{tier_base}_{bin_suffix}"
+            else:
+                # Enough segment-wide data but no local samples in range;
+                # use all same-side segment rows as a broad fallback.
+                members = rows
+                method = f"{tier_base}_all"
             observed = sum(1 for r in members if _is_win(side, r.realized_outcome)) / len(members)
             shrink = len(members) / (len(members) + max(CONFIG.calibration_shrinkage_k, 1.0))
             fair = _clamp((observed * shrink) + (p * (1.0 - shrink)))
             error = abs(fair - observed)
-            sample_score = min(1.0, len(members) / max(min_samples, 1))
+            # Confidence rises above the floor only when both conditions are met:
+            # 1. Segment-level total clears total_gate (seg_score = 1.0 when satisfied).
+            # 2. Local/adaptive sample count clears bin_min (local_score = 1.0 when satisfied).
+            # The "_all" fallback reduces local_score proportionally since local_members
+            # did not reach bin_min.
+            seg_score = min(1.0, len(rows) / max(total_gate, 1))
+            local_score = min(1.0, len(local_members) / max(bin_min, 1))
             error_score = 1.0 - min(1.0, error * 2.0)
-            confidence = _clamp(max(CONFIG.model_confidence_floor, sample_score * error_score))
+            confidence = _clamp(
+                max(CONFIG.model_confidence_floor, seg_score * local_score * error_score),
+                CONFIG.model_confidence_floor,
+            )
             return CalibrationResult(
                 raw_synth_probability=p,
                 fair_probability=fair,

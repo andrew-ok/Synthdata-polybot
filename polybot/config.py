@@ -129,6 +129,7 @@ class Config:
     calibration_bins: int = field(default_factory=lambda: int(_env("CALIBRATION_BINS", "10") or "10"))
     min_calibration_samples_segment: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES_SEGMENT", "100") or "100"))
     min_calibration_samples_global: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES_GLOBAL", "300") or "300"))
+    min_calibration_bin_samples: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_BIN_SAMPLES", "20") or "20"))
     calibration_shrinkage_k: float = field(default_factory=lambda: _env_float("CALIBRATION_SHRINKAGE_K", 200.0))
     min_calibration_samples: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES", "30") or "30"))
     confidence_min_samples: int = field(default_factory=lambda: int(_env("CONFIDENCE_MIN_SAMPLES", "50") or "50"))
