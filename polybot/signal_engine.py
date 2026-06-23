@@ -24,8 +24,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
-from .calibration import Calibrator
+from .calibration import Calibrator, CalibrationResult
 from .config import CONFIG
+from .event_identity import event_key_for_opportunity
 from .synth_client import Opportunity
 
 
@@ -34,10 +35,19 @@ class Signal:
     asset: str
     horizon: str
     slug: str
+    event_key: str
     market_url: str
     market_question: str          # synthesised from slug for the dashboard
-    condition_id: str             # we use the slug as the dedupe / corr key
+    condition_id: str
     side: str                     # "UP" or "DOWN"
+    raw_synth_probability: float
+    fair_probability: float
+    calibration_method: str
+    calibration_sample_count: int
+    confidence_score: float
+    calibration_error_estimate: float
+    entry_price: float
+    exit_price: float
     synth_probability: float
     calibrated_probability: float
     execution_price: float
@@ -47,6 +57,10 @@ class Signal:
     net_edge: float
     model_confidence: float
     expected_value_score: float
+    score: float
+    liquidity_score: float
+    regime_score: float
+    entry_cost: float
     spread: Optional[float]
     liquidity: float              # USD at top of relevant side
     hours_to_resolution: Optional[float]
@@ -55,6 +69,8 @@ class Signal:
     threshold: float
     category: str = "crypto"
     reason: str = "insights"
+    clob_source: str = "real_clob"
+    is_stale: bool = False
 
 
 def _net(raw: float) -> float:
@@ -75,8 +91,89 @@ def _liquidity_score(liquidity: float) -> float:
     return max(0.0, min(1.0, liquidity / (CONFIG.min_liquidity * 5.0)))
 
 
+def _entry_cost() -> float:
+    return (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0
+
+
 def _question_from(opp: Opportunity) -> str:
-    return f"{opp.asset} {opp.horizon} Up/Down — {opp.slug}"
+    return f"{opp.asset} {opp.horizon} Up/Down - {opp.slug}"
+
+
+def _is_stale(opp: Opportunity) -> bool:
+    if opp.event_age_sec is not None and opp.event_age_sec < -1:
+        return True
+    # Historical backtests may not carry a CLOB fetch timestamp; do not mark
+    # those stale unless real two-sided CLOB is explicitly required by live scan.
+    return False
+
+
+def _signal(
+    opp: Opportunity,
+    side: str,
+    ask: float,
+    bid: float,
+    spread: Optional[float],
+    liquidity: float,
+    raw_probability: float,
+    calibration: CalibrationResult,
+    threshold: float,
+    reason: str,
+    clob_source: str,
+) -> Optional[Signal]:
+    if not (0 < ask < 1):
+        return None
+    if bid is not None and not (0 <= bid < 1):
+        return None
+    if spread is not None and spread > CONFIG.max_spread:
+        return None
+    entry_cost = _entry_cost()
+    net_ev = calibration.fair_probability - ask - entry_cost
+    if net_ev < threshold:
+        return None
+    liq_score = _liquidity_score(liquidity)
+    regime_score = 1.0
+    confidence = calibration.confidence_score
+    score = net_ev * confidence * liq_score * regime_score
+    return Signal(
+        asset=opp.asset,
+        horizon=opp.horizon,
+        slug=opp.slug,
+        event_key=event_key_for_opportunity(opp),
+        market_url=opp.polymarket_url,
+        market_question=_question_from(opp),
+        condition_id=opp.condition_id,
+        side=side,
+        raw_synth_probability=raw_probability,
+        fair_probability=calibration.fair_probability,
+        calibration_method=calibration.calibration_method,
+        calibration_sample_count=calibration.sample_count,
+        confidence_score=confidence,
+        calibration_error_estimate=calibration.calibration_error_estimate,
+        entry_price=ask,
+        exit_price=bid,
+        synth_probability=raw_probability,
+        calibrated_probability=calibration.fair_probability,
+        execution_price=ask,
+        counterparty_bid=bid,
+        raw_edge=raw_probability - ask,
+        calibrated_edge=calibration.fair_probability - ask,
+        net_edge=net_ev,
+        model_confidence=confidence,
+        expected_value_score=score,
+        score=score,
+        liquidity_score=liq_score,
+        regime_score=regime_score,
+        entry_cost=entry_cost,
+        spread=spread,
+        liquidity=liquidity,
+        hours_to_resolution=opp.hours_to_event_end,
+        event_age_sec=opp.event_age_sec,
+        seconds_to_event_end=opp.seconds_to_event_end,
+        threshold=threshold,
+        reason=reason,
+        clob_source=clob_source,
+        is_stale=_is_stale(opp),
+    )
 
 
 def evaluate(
@@ -84,49 +181,28 @@ def evaluate(
     threshold: Optional[float] = None,
     calibrator: Optional[Calibrator] = None,
 ) -> List[Signal]:
-    thr = CONFIG.min_edge_threshold if threshold is None else threshold
+    thr = CONFIG.min_entry_edge if threshold is None else threshold
     calibrator = calibrator or Calibrator()
     signals: List[Signal] = []
 
     for opp in opportunities:
         if calibrator.segment_disabled(opp.asset, opp.horizon):
             continue
-        model_confidence = calibrator.model_confidence(opp.asset, opp.horizon)
-        spread = _spread(opp.best_bid_price, opp.best_ask_price)
-        htr = opp.hours_to_event_end
-        event_age_sec = opp.event_age_sec
-        seconds_to_event_end = opp.seconds_to_event_end
+        if not event_key_for_opportunity(opp):
+            continue
 
         # --- Up leg ---
-        if opp.best_ask_price is not None:
-            ask_up = opp.best_ask_price
-            synth_up = opp.synth_probability_up
-            cal_up = calibrator.calibrate(opp.asset, opp.horizon, synth_up)
-            edge_up = cal_up - ask_up
-            liquidity_up = opp.best_ask_size * ask_up
-            if edge_up >= thr:
-                signals.append(Signal(
-                    asset=opp.asset, horizon=opp.horizon, slug=opp.slug,
-                    market_url=opp.polymarket_url,
-                    market_question=_question_from(opp),
-                    condition_id=opp.slug,
-                    side="UP",
-                    synth_probability=synth_up,
-                    calibrated_probability=cal_up,
-                    execution_price=ask_up,
-                    counterparty_bid=opp.best_bid_price or 0.0,
-                    raw_edge=edge_up,
-                    calibrated_edge=edge_up,
-                    net_edge=_net(edge_up),
-                    model_confidence=model_confidence,
-                    expected_value_score=edge_up * _liquidity_score(liquidity_up) * model_confidence,
-                    spread=spread,
-                    liquidity=liquidity_up,
-                    hours_to_resolution=htr,
-                    event_age_sec=event_age_sec,
-                    seconds_to_event_end=seconds_to_event_end,
-                    threshold=thr,
-                ))
+        yes_bid = opp.yes_bid_price if opp.yes_bid_price is not None else opp.best_bid_price
+        yes_ask = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
+        yes_spread = _spread(yes_bid, yes_ask)
+        yes_liq = (opp.yes_ask_size or opp.best_ask_size) * (yes_ask or 0.0)
+        if yes_ask is not None and yes_bid is not None:
+            cal = calibrator.calibrate_side(opp.asset, opp.horizon, "UP", opp.synth_probability_up)
+            sig = _signal(opp, "UP", yes_ask, yes_bid, yes_spread, yes_liq, opp.synth_probability_up, cal, thr, "real_yes_clob", "real_clob")
+            if sig:
+                signals.append(sig)
+        elif CONFIG.require_real_two_sided_clob:
+            pass
 
         # --- Down leg (real CLOB book if available; otherwise complementary book) ---
         if opp.no_ask_price is not None:
@@ -135,45 +211,24 @@ def evaluate(
             spread_down = _spread(opp.no_bid_price, opp.no_ask_price)
             liquidity_down = opp.no_ask_size * ask_down
             reason = "real_down_clob"
-        elif opp.best_bid_price is not None:
+            clob_source = "real_clob"
+        elif CONFIG.allow_complementary_book_fallback and opp.best_bid_price is not None:
             implied_down_ask = max(0.0, min(1.0, 1.0 - opp.best_bid_price))
             ask_down = implied_down_ask
             bid_down = max(0.0, 1.0 - (opp.best_ask_price or 1.0))
-            spread_down = spread
+            spread_down = _spread(opp.best_bid_price, opp.best_ask_price)
             liquidity_down = opp.best_bid_size * opp.best_bid_price
             reason = "complementary_book"
+            clob_source = "complementary_book"
         else:
             ask_down = None
 
         if ask_down is not None:
             synth_down = opp.synth_probability_down
-            cal_up_for_down = calibrator.calibrate(opp.asset, opp.horizon, opp.synth_probability_up)
-            cal_down = 1.0 - cal_up_for_down
-            edge_down = cal_down - ask_down
-            if edge_down >= thr and 0 < ask_down < 1:
-                signals.append(Signal(
-                    asset=opp.asset, horizon=opp.horizon, slug=opp.slug,
-                    market_url=opp.polymarket_url,
-                    market_question=_question_from(opp),
-                    condition_id=opp.slug,
-                    side="DOWN",
-                    synth_probability=synth_down,
-                    calibrated_probability=cal_down,
-                    execution_price=ask_down,
-                    counterparty_bid=bid_down,
-                    raw_edge=edge_down,
-                    calibrated_edge=edge_down,
-                    net_edge=_net(edge_down),
-                    model_confidence=model_confidence,
-                    expected_value_score=edge_down * _liquidity_score(liquidity_down) * model_confidence,
-                    spread=spread_down,
-                    liquidity=liquidity_down,
-                    hours_to_resolution=htr,
-                    event_age_sec=event_age_sec,
-                    seconds_to_event_end=seconds_to_event_end,
-                    threshold=thr,
-                    reason=reason,
-                ))
+            cal = calibrator.calibrate_side(opp.asset, opp.horizon, "DOWN", synth_down)
+            sig = _signal(opp, "DOWN", ask_down, bid_down, spread_down, liquidity_down, synth_down, cal, thr, reason, clob_source)
+            if sig:
+                signals.append(sig)
 
-    signals.sort(key=lambda s: s.expected_value_score, reverse=True)
+    signals.sort(key=lambda s: s.score, reverse=True)
     return signals

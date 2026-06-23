@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set
 
 from .config import CONFIG
+from .position_manager import exposure_summary, has_open_event, recently_closed_or_opened, open_positions
 from .signal_engine import Signal
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class RiskManager:
         self.use_kelly = use_kelly
         self.bankroll = CONFIG.bankroll_usd
         self.opened_condition_ids = _load_opened_condition_ids()
+        self.exposure = exposure_summary()
+        self.open_positions = open_positions()
 
     def evaluate(self, signals: Iterable[Signal]) -> List[Decision]:
         # Hard precondition: rule 7.
@@ -64,8 +67,12 @@ class RiskManager:
 
         decisions: List[Decision] = []
         seen_condition_ids: Set[str] = set()
+        seen_event_keys: Set[str] = set()
         seen_corr: Dict[str, Decision] = {}
-        deployed = 0.0
+        deployed = float(self.exposure["total"])
+        accepted_count = 0
+        accepted_by_asset: Dict[str, int] = {}
+        accepted_by_horizon: Dict[str, int] = {}
 
         for sig in signals:
             ok, reason = self._gates(sig)
@@ -73,9 +80,16 @@ class RiskManager:
                 decisions.append(Decision(sig, False, reason))
                 continue
 
-            condition_id = (sig.condition_id or sig.slug or "").strip()
-            if condition_id and condition_id in self.opened_condition_ids:
-                decisions.append(Decision(sig, False, "position already opened for this event contract"))
+            event_key = sig.event_key
+            condition_id = (sig.condition_id or sig.event_key or sig.slug or "").strip()
+            if event_key and has_open_event(event_key):
+                decisions.append(Decision(sig, False, "open position already exists for this event_key"))
+                continue
+            if event_key and recently_closed_or_opened(event_key):
+                decisions.append(Decision(sig, False, "event_key in position cooldown"))
+                continue
+            if event_key and event_key in seen_event_keys:
+                decisions.append(Decision(sig, False, "position already selected for this event_key in this scan"))
                 continue
             if condition_id and condition_id in seen_condition_ids:
                 decisions.append(Decision(sig, False, "position already selected for this event contract in this scan"))
@@ -89,6 +103,19 @@ class RiskManager:
             size_usd, contracts = self._size(sig)
             if size_usd <= 0:
                 decisions.append(Decision(sig, False, "sizing produced zero notional"))
+                continue
+
+            if accepted_count >= CONFIG.max_trades_per_scan:
+                decisions.append(Decision(sig, False, "max_trades_per_scan reached"))
+                continue
+            if self.exposure["count"] + accepted_count >= CONFIG.max_open_positions:
+                decisions.append(Decision(sig, False, "max_open_positions reached"))
+                continue
+            if sum(1 for p in self.open_positions if p.asset == sig.asset) + accepted_by_asset.get(sig.asset, 0) >= CONFIG.max_open_positions_per_asset:
+                decisions.append(Decision(sig, False, "max_open_positions_per_asset reached"))
+                continue
+            if sum(1 for p in self.open_positions if p.horizon == sig.horizon) + accepted_by_horizon.get(sig.horizon, 0) >= CONFIG.max_open_positions_per_horizon:
+                decisions.append(Decision(sig, False, "max_open_positions_per_horizon reached"))
                 continue
 
             # Rule 6: position size cap (1–2% of bankroll).
@@ -110,30 +137,43 @@ class RiskManager:
             if deployed + size_usd > CONFIG.max_total_exposure * self.bankroll:
                 decisions.append(Decision(sig, False, "max_total_exposure reached"))
                 continue
+            if self.exposure["by_asset"].get(sig.asset, 0.0) + size_usd > CONFIG.max_asset_exposure * self.bankroll:
+                decisions.append(Decision(sig, False, "max_asset_exposure reached"))
+                continue
+            if self.exposure["by_horizon"].get(sig.horizon, 0.0) + size_usd > CONFIG.max_horizon_exposure * self.bankroll:
+                decisions.append(Decision(sig, False, "max_horizon_exposure reached"))
+                continue
 
             decision = Decision(sig, True, "accepted", size_usd, contracts)
             decisions.append(decision)
+            if event_key:
+                seen_event_keys.add(event_key)
             if condition_id:
                 seen_condition_ids.add(condition_id)
             if corr:
                 seen_corr[corr] = decision
             deployed += size_usd
+            accepted_count += 1
+            accepted_by_asset[sig.asset] = accepted_by_asset.get(sig.asset, 0) + 1
+            accepted_by_horizon[sig.horizon] = accepted_by_horizon.get(sig.horizon, 0) + 1
 
         return decisions
 
     def _gates(self, sig: Signal) -> tuple[bool, str]:
-        # Rule 2: raw edge >= 20pp.
-        if sig.raw_edge < CONFIG.min_edge_threshold:
-            return False, f"raw edge {sig.raw_edge:.3f} < {CONFIG.min_edge_threshold:.2f}"
-        # Rule 3: net edge >= 12pp after fees/slippage.
-        if sig.net_edge < CONFIG.min_net_edge_threshold:
-            return False, f"net edge {sig.net_edge:.3f} < {CONFIG.min_net_edge_threshold:.2f}"
+        if sig.net_edge < CONFIG.min_entry_edge:
+            return False, f"net entry edge {sig.net_edge:.3f} < {CONFIG.min_entry_edge:.3f}"
+        if sig.confidence_score < CONFIG.min_confidence_score:
+            return False, f"confidence {sig.confidence_score:.3f} < {CONFIG.min_confidence_score:.3f}"
         # Rule 4: spread <= 5pp.
         if sig.spread is not None and sig.spread > CONFIG.max_spread:
             return False, f"spread {sig.spread:.3f} > max_spread {CONFIG.max_spread:.3f}"
         # Rule 5 (floor — actual size-aware check happens after sizing).
         if sig.liquidity < CONFIG.min_liquidity:
             return False, f"liquidity ${sig.liquidity:.0f} < ${CONFIG.min_liquidity:.0f}"
+        if sig.is_stale:
+            return False, "stale Synth or CLOB data"
+        if CONFIG.require_real_two_sided_clob and sig.clob_source != "real_clob":
+            return False, "real two-sided CLOB required"
 
         max_age = CONFIG.max_entry_age_15m_sec if sig.horizon == "15M" else CONFIG.max_entry_age_1h_sec
         if sig.event_age_sec is not None and sig.event_age_sec > max_age:

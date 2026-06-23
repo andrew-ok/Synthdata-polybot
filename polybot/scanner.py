@@ -24,16 +24,18 @@ from .config import CONFIG
 from .calibration import write_calibration_report
 from .clob_enrichment import enrich_real_clob
 from .dashboard import render
-from .exit_rules import evaluate_open_exits
+from .exit_rules import evaluate_and_apply_exits
 from .reports import (
     current_report_date,
     daily_report_rows,
     format_daily_report,
     write_daily_report,
+    write_strategy_b_reports,
 )
 from .execution import execute_decisions
 from .risk_manager import RiskManager
 from .signal_engine import evaluate
+from .snapshot_store import write_snapshots
 from .synth_client import SynthInsightsClient, configured_horizons
 
 
@@ -53,15 +55,18 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
     horizons = configured_horizons()
     opps = client.fetch_all(assets=CONFIG.synth_assets, horizons=horizons)
     opps = enrich_real_clob(opps)
+    snapshot_rows = write_snapshots(opps)
     log.info("Opportunities: %d  (assets=%s)", len(opps), CONFIG.synth_assets)
+    log.info("Snapshots written: %d", len(snapshot_rows))
 
+    all_side_signals = evaluate(opps, threshold=-1.0)
     if execute:
-        exits = evaluate_open_exits(opps)
+        exits = evaluate_and_apply_exits(all_side_signals)
         if exits:
             log.info("Exit signals written: %d (see %s/exit_signals.jsonl)", len(exits), CONFIG.log_dir)
 
     signals = evaluate(opps)
-    log.info("Signals at raw threshold %.2f: %d", CONFIG.min_edge_threshold, len(signals))
+    log.info("Signals at fair edge threshold %.3f: %d", CONFIG.min_entry_edge, len(signals))
 
     risk = RiskManager(use_kelly=kelly)
     decisions = risk.evaluate(signals)
@@ -72,6 +77,7 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
 
     if execute:
         fills = execute_decisions(decisions)
+        write_strategy_b_reports()
         log.info("Paper-trade fills written: %d (see %s)", len(fills), CONFIG.log_dir)
 
     return 0 if accepted else 1
@@ -169,6 +175,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Print and save a daily paper-trade report")
     p.add_argument("--calibration-report", action="store_true",
                    help="Generate calibration metrics and reliability curves")
+    p.add_argument("--strategy-b-report", action="store_true",
+                   help="Generate Strategy B positions, exposure, and edge-decay reports")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -190,6 +198,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         paths = write_calibration_report()
         print(f"Saved calibration report: {paths['markdown']}")
         print(f"Saved calibration stats:  {paths['json']}")
+        return 0
+
+    if args.strategy_b_report:
+        paths = write_strategy_b_reports()
+        for label, path in paths.items():
+            print(f"Saved {label}: {path}")
         return 0
 
     if args.backtest:

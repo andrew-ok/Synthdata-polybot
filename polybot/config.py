@@ -47,11 +47,19 @@ class Config:
 
     # --- Trading mode ---
     paper_trade_mode: bool = field(default_factory=lambda: _env_bool("PAPER_TRADE_MODE", True))
+    enable_live_trading: bool = field(default_factory=lambda: _env_bool("ENABLE_LIVE_TRADING", False))
 
     # --- Bankroll / sizing ---
     bankroll_usd: float = field(default_factory=lambda: _env_float("BANKROLL_USD", 1000.0))
     max_position_size: float = field(default_factory=lambda: _env_float("MAX_POSITION_SIZE", 0.01))  # 1% of bankroll
     max_total_exposure: float = field(default_factory=lambda: _env_float("MAX_TOTAL_EXPOSURE", 0.25))  # 25% of bankroll deployed
+    max_asset_exposure: float = field(default_factory=lambda: _env_float("MAX_ASSET_EXPOSURE", 0.10))
+    max_horizon_exposure: float = field(default_factory=lambda: _env_float("MAX_HORIZON_EXPOSURE", 0.15))
+    max_trades_per_scan: int = field(default_factory=lambda: int(_env("MAX_TRADES_PER_SCAN", "2") or "2"))
+    max_open_positions: int = field(default_factory=lambda: int(_env("MAX_OPEN_POSITIONS", "5") or "5"))
+    max_open_positions_per_asset: int = field(default_factory=lambda: int(_env("MAX_OPEN_POSITIONS_PER_ASSET", "2") or "2"))
+    max_open_positions_per_horizon: int = field(default_factory=lambda: int(_env("MAX_OPEN_POSITIONS_PER_HORIZON", "3") or "3"))
+    position_cooldown_seconds: float = field(default_factory=lambda: _env_float("POSITION_COOLDOWN_SECONDS", 300.0))
     kelly_fraction: float = field(default_factory=lambda: _env_float("KELLY_FRACTION", 0.25))  # fractional Kelly when enabled
     max_kelly_fraction: float = field(default_factory=lambda: _env_float("MAX_KELLY_FRACTION", 0.25))
 
@@ -59,8 +67,11 @@ class Config:
     # Hard rules:
     #   raw edge (synth_prob - ask) must be >= min_edge_threshold (20pp default)
     #   net edge (raw - fees - slippage)  must be >= min_net_edge_threshold (12pp default)
-    min_edge_threshold: float = field(default_factory=lambda: _env_float("MIN_EDGE_THRESHOLD", 0.20))
-    min_net_edge_threshold: float = field(default_factory=lambda: _env_float("MIN_NET_EDGE_THRESHOLD", 0.12))
+    min_entry_edge: float = field(default_factory=lambda: _env_float("MIN_ENTRY_EDGE", _env_float("MIN_EDGE_THRESHOLD", 0.06)))
+    min_exit_edge: float = field(default_factory=lambda: _env_float("MIN_EXIT_EDGE", 0.015))
+    min_confidence_score: float = field(default_factory=lambda: _env_float("MIN_CONFIDENCE_SCORE", 0.50))
+    min_edge_threshold: float = field(default_factory=lambda: _env_float("MIN_EDGE_THRESHOLD", _env_float("MIN_ENTRY_EDGE", 0.06)))
+    min_net_edge_threshold: float = field(default_factory=lambda: _env_float("MIN_NET_EDGE_THRESHOLD", _env_float("MIN_ENTRY_EDGE", 0.06)))
     backtest_thresholds: tuple = (0.10, 0.15, 0.20, 0.25, 0.30)
 
     # Liquidity-vs-size rule: required book depth >= position_size_usd * this multiple,
@@ -69,7 +80,7 @@ class Config:
 
     # --- Market quality filters ---
     max_spread: float = field(default_factory=lambda: _env_float("MAX_SPREAD", 0.05))            # 5 cents
-    min_liquidity: float = field(default_factory=lambda: _env_float("MIN_LIQUIDITY", 500.0))     # USD on the relevant side
+    min_liquidity: float = field(default_factory=lambda: _env_float("MIN_LIQUIDITY_USD", _env_float("MIN_LIQUIDITY", 500.0)))     # USD on the relevant side
     min_volume: float = field(default_factory=lambda: _env_float("MIN_VOLUME", 1000.0))          # USD lifetime
     min_hours_to_resolution: float = field(default_factory=lambda: _env_float("MIN_HOURS_TO_RES", 0.0))
     max_entry_age_15m_sec: float = field(default_factory=lambda: _env_float("MAX_ENTRY_AGE_15M_SEC", 180.0))
@@ -102,9 +113,13 @@ class Config:
     synth_historical_cache_ttl_sec: float = field(default_factory=lambda: _env_float("SYNTH_HISTORICAL_CACHE_TTL_SEC", 604800.0))
     max_backtest_calls_without_confirm: int = field(default_factory=lambda: int(_env("MAX_BACKTEST_CALLS_WITHOUT_CONFIRM", "500") or "500"))
     use_real_two_sided_clob: bool = field(default_factory=lambda: _env_bool_any(
-        ("USE_REAL_TWO_SIDED_CLOB", "USE_REAL_DOWN_CLOB"),
+        ("REQUIRE_REAL_TWO_SIDED_CLOB", "USE_REAL_TWO_SIDED_CLOB", "USE_REAL_DOWN_CLOB"),
         True,
     ))
+    require_real_two_sided_clob: bool = field(default_factory=lambda: _env_bool("REQUIRE_REAL_TWO_SIDED_CLOB", True))
+    allow_complementary_book_fallback: bool = field(default_factory=lambda: _env_bool("ALLOW_COMPLEMENTARY_BOOK_FALLBACK", False))
+    max_synth_staleness_sec: float = field(default_factory=lambda: _env_float("MAX_SYNTH_STALENESS_SEC", 90.0))
+    max_clob_staleness_sec: float = field(default_factory=lambda: _env_float("MAX_CLOB_STALENESS_SEC", 30.0))
     max_backtest_snapshot_lag_sec: float = field(default_factory=lambda: _env_float("MAX_BACKTEST_SNAPSHOT_LAG_SEC", 90.0))
     allow_current_outcome_backtest_label: bool = field(default_factory=lambda: _env_bool("ALLOW_CURRENT_OUTCOME_BACKTEST_LABEL", False))
 
@@ -112,6 +127,9 @@ class Config:
     calibration_db_path: str = field(default_factory=lambda: _env("CALIBRATION_DB_PATH", "polybot/data/calibration/observations.jsonl") or "polybot/data/calibration/observations.jsonl")
     calibration_report_dir: str = field(default_factory=lambda: _env("CALIBRATION_REPORT_DIR", "polybot/logs/calibration") or "polybot/logs/calibration")
     calibration_bins: int = field(default_factory=lambda: int(_env("CALIBRATION_BINS", "10") or "10"))
+    min_calibration_samples_segment: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES_SEGMENT", "100") or "100"))
+    min_calibration_samples_global: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES_GLOBAL", "300") or "300"))
+    calibration_shrinkage_k: float = field(default_factory=lambda: _env_float("CALIBRATION_SHRINKAGE_K", 200.0))
     min_calibration_samples: int = field(default_factory=lambda: int(_env("MIN_CALIBRATION_SAMPLES", "30") or "30"))
     confidence_min_samples: int = field(default_factory=lambda: int(_env("CONFIDENCE_MIN_SAMPLES", "50") or "50"))
     model_confidence_floor: float = field(default_factory=lambda: _env_float("MODEL_CONFIDENCE_FLOOR", 0.25))
@@ -134,10 +152,16 @@ class Config:
     # --- Paths ---
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "polybot/logs") or "polybot/logs")
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "polybot/data") or "polybot/data")
+    snapshot_db_path: str = field(default_factory=lambda: _env("SNAPSHOT_DB_PATH", "polybot/data/snapshots.sqlite3") or "polybot/data/snapshots.sqlite3")
+    positions_path: str = field(default_factory=lambda: _env("POSITIONS_PATH", "polybot/logs/positions.jsonl") or "polybot/logs/positions.jsonl")
 
     def assert_paper_only(self) -> None:
-        if not self.paper_trade_mode:
-            raise RuntimeError("Live trading is disabled. Set PAPER_TRADE_MODE=true to proceed.")
+        if not self.paper_trade_mode or self.enable_live_trading:
+            raise RuntimeError("Live trading is disabled. Require PAPER_TRADE_MODE=true and ENABLE_LIVE_TRADING=false.")
+
+    def assert_live_allowed(self) -> None:
+        if self.paper_trade_mode or not self.enable_live_trading:
+            raise RuntimeError("Live trading requires PAPER_TRADE_MODE=false and ENABLE_LIVE_TRADING=true, and is not implemented yet.")
 
 
 CONFIG = Config()

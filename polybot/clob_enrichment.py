@@ -7,6 +7,7 @@ slug and fetch both YES/NO token books so both sides use executable CLOB asks.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Iterable, List
 
 from .config import CONFIG
@@ -28,9 +29,11 @@ def enrich_real_clob(opportunities: Iterable[Opportunity]) -> List[Opportunity]:
         market = client.market_by_slug(opp.slug)
         if market is None or not market.token_id_yes or not market.token_id_no:
             continue
+        opp.condition_id = market.condition_id or opp.condition_id
 
         yes_book = client.fetch_book(market.token_id_yes)
         no_book = client.fetch_book(market.token_id_no)
+        opp.clob_snapshot_time = datetime.now(timezone.utc)
         if yes_book:
             yb, ya, _, ybs, yas = client._best_levels(yes_book)
             opp.yes_bid_price = yb

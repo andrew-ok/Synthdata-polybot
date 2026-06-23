@@ -28,6 +28,16 @@ class CalibrationObservation:
     source: str = "historical_synth"
 
 
+@dataclass
+class CalibrationResult:
+    raw_synth_probability: float
+    fair_probability: float
+    calibration_method: str
+    sample_count: int
+    confidence_score: float
+    calibration_error_estimate: float
+
+
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
@@ -80,6 +90,22 @@ def _optfloat(x: Any) -> Optional[float]:
 
 def _segment_key(asset: str, horizon: str) -> Tuple[str, str]:
     return asset.upper(), horizon
+
+
+def _bin_index(probability: float) -> int:
+    n_bins = max(2, CONFIG.calibration_bins)
+    return min(n_bins - 1, max(0, int(_clamp(probability) * n_bins)))
+
+
+def _bin_members(rows: List[CalibrationObservation], probability: float) -> List[CalibrationObservation]:
+    idx = _bin_index(probability)
+    n_bins = max(2, CONFIG.calibration_bins)
+    lo = idx / n_bins
+    hi = (idx + 1) / n_bins
+    return [
+        r for r in rows
+        if lo <= r.predicted_probability < hi or (idx == n_bins - 1 and r.predicted_probability <= hi)
+    ]
 
 
 def _returns(rows: Iterable[CalibrationObservation]) -> List[float]:
@@ -168,31 +194,51 @@ class Calibrator:
     def __init__(self, observations: Optional[List[CalibrationObservation]] = None):
         self.observations = observations if observations is not None else load_observations()
         self._by_segment: Dict[Tuple[str, str], List[CalibrationObservation]] = defaultdict(list)
+        self._by_segment_side: Dict[Tuple[str, str, str], List[CalibrationObservation]] = defaultdict(list)
         for row in self.observations:
             if row.realized_outcome in ("UP", "DOWN"):
                 self._by_segment[_segment_key(row.asset, row.horizon)].append(row)
+                self._by_segment_side[(row.asset.upper(), row.horizon, row.side.upper())].append(row)
         self._metrics = segment_metrics(self.observations)
 
-    def calibrate(self, asset: str, horizon: str, predicted_probability: float) -> float:
+    def calibrate_side(self, asset: str, horizon: str, side: str, predicted_probability: float) -> CalibrationResult:
         p = _clamp(predicted_probability)
-        rows = self._by_segment.get(_segment_key(asset, horizon), [])
-        if len(rows) < CONFIG.min_calibration_samples:
-            return p
-
-        n_bins = max(2, CONFIG.calibration_bins)
-        idx = min(n_bins - 1, max(0, int(p * n_bins)))
-        lo = idx / n_bins
-        hi = (idx + 1) / n_bins
-        members = [
-            r for r in rows
-            if lo <= r.predicted_probability < hi or (idx == n_bins - 1 and r.predicted_probability <= hi)
+        side = side.upper()
+        candidates = [
+            ("asset_horizon_side", self._by_segment_side.get((asset.upper(), horizon, side), []), CONFIG.min_calibration_samples_segment),
+            ("asset_horizon", self._by_segment.get(_segment_key(asset, horizon), []), CONFIG.min_calibration_samples_segment),
+            ("global", self.observations, CONFIG.min_calibration_samples_global),
         ]
-        if len(members) < CONFIG.min_calibration_samples:
-            return p
+        for method, rows, min_samples in candidates:
+            members = _bin_members(rows, p)
+            if len(members) < min_samples:
+                continue
+            observed = sum(1 for r in members if _is_win(side, r.realized_outcome)) / len(members)
+            shrink = len(members) / (len(members) + max(CONFIG.calibration_shrinkage_k, 1.0))
+            fair = _clamp((observed * shrink) + (p * (1.0 - shrink)))
+            error = abs(fair - observed)
+            sample_score = min(1.0, len(members) / max(min_samples, 1))
+            error_score = 1.0 - min(1.0, error * 2.0)
+            confidence = _clamp(max(CONFIG.model_confidence_floor, sample_score * error_score))
+            return CalibrationResult(
+                raw_synth_probability=p,
+                fair_probability=fair,
+                calibration_method=method,
+                sample_count=len(members),
+                confidence_score=confidence,
+                calibration_error_estimate=error,
+            )
+        return CalibrationResult(
+            raw_synth_probability=p,
+            fair_probability=p,
+            calibration_method="raw_low_sample",
+            sample_count=0,
+            confidence_score=CONFIG.model_confidence_floor,
+            calibration_error_estimate=1.0,
+        )
 
-        observed = sum(1 for r in members if r.realized_outcome == "UP") / len(members)
-        shrink = min(1.0, len(members) / max(CONFIG.min_calibration_samples * 3, 1))
-        return _clamp((observed * shrink) + (p * (1.0 - shrink)))
+    def calibrate(self, asset: str, horizon: str, predicted_probability: float) -> float:
+        return self.calibrate_side(asset, horizon, "UP", predicted_probability).fair_probability
 
     def model_confidence(self, asset: str, horizon: str) -> float:
         key = f"{asset.upper()}-{horizon}"

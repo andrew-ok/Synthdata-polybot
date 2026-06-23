@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .config import CONFIG
+from .event_identity import event_key_for_opportunity
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +157,7 @@ class Opportunity:
     asset: str
     horizon: str              # "15M" or "1H"
     slug: str
+    condition_id: str
     event_start_time: datetime
     event_end_time: datetime
     forecast_start_time: Optional[datetime]
@@ -179,6 +181,7 @@ class Opportunity:
     start_price: float
     current_outcome: str               # realized so far (Up/Down)
     resolved_outcome: Optional[str] = None   # populated for historical snapshots
+    clob_snapshot_time: Optional[datetime] = None
 
     # Optional real two-token CLOB data, populated by Polymarket enrichment.
     yes_bid_price: Optional[float] = None
@@ -191,6 +194,10 @@ class Opportunity:
     no_ask_size: float = 0.0
 
     raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_key(self) -> str:
+        return event_key_for_opportunity(self)
 
     @property
     def synth_probability_down(self) -> float:
@@ -280,6 +287,7 @@ class SynthInsightsClient:
                 asset=asset,
                 horizon=horizon,
                 slug=str(data.get("slug") or ""),
+                condition_id=str(data.get("condition_id") or data.get("conditionId") or ""),
                 event_start_time=cls._parse_dt(data.get("event_start_time")) or datetime.now(timezone.utc),
                 event_end_time=cls._parse_dt(data.get("event_end_time")) or datetime.now(timezone.utc),
                 forecast_start_time=cls._parse_dt(data.get("forecast_start_time")),
