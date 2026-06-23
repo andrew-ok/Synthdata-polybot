@@ -171,6 +171,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--kelly", action="store_true", help="Use fractional-Kelly sizing")
     p.add_argument("--backtest", nargs=2, metavar=("START_ISO", "END_ISO"),
                    help="Run a historical backtest between two ISO timestamps")
+    p.add_argument("--snapshot-backtest", action="store_true",
+                   help="Replay stored SQLite snapshots chronologically with Strategy B")
     p.add_argument("--daily-report", nargs="?", const="today", metavar="YYYY-MM-DD",
                    help="Print and save a daily paper-trade report")
     p.add_argument("--calibration-report", action="store_true",
@@ -208,6 +210,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.backtest:
         return run_backtest_cli(*args.backtest)
+    if args.snapshot_backtest:
+        from .backtester import run_snapshot_backtest
+        print(run_snapshot_backtest())
+        return 0
     return run_scan(args.execute, args.show_skipped, args.limit, args.kelly)
 
 

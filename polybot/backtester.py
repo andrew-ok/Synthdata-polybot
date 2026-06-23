@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -270,3 +272,123 @@ def best_threshold(results: List[Dict[str, object]]) -> Optional[float]:
     if not results:
         return None
     return results[0]["threshold"]
+
+
+@dataclass
+class _ReplayPosition:
+    event_key: str
+    asset: str
+    horizon: str
+    side: str
+    entry_time: datetime
+    entry_price: float
+    contracts: float
+    notional: float
+    entry_edge: float
+    calibration_method: str
+
+
+def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, object]:
+    """Replay stored snapshots chronologically with Strategy B rules."""
+    path = snapshot_db_path or CONFIG.snapshot_db_path
+    stats = _Stats(threshold=CONFIG.min_entry_edge)
+    if not os.path.exists(path):
+        out = stats.summary()
+        out["source"] = "snapshot_replay"
+        out["note"] = "snapshot database does not exist"
+        return out
+
+    calibrator = Calibrator()
+    open_by_event: Dict[str, _ReplayPosition] = {}
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM snapshots
+            ORDER BY timestamp_utc ASC, event_key ASC, side ASC
+            """
+        ).fetchall()
+
+    for row in rows:
+        event_key = row["event_key"]
+        side = row["side"]
+        ask = row["best_ask"]
+        bid = row["best_bid"]
+        spread = row["spread"]
+        liquidity = row["near_top_liquidity_usd"] or 0.0
+        is_stale = bool(row["is_stale"])
+        timestamp = datetime.fromisoformat(row["timestamp_utc"])
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        existing = open_by_event.get(event_key)
+        if existing and existing.side == side and bid is not None:
+            cal = calibrator.calibrate_side(row["asset"], row["horizon"], side, row["raw_synth_probability"])
+            hold_edge = cal.fair_probability - float(bid) - ((CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0)
+            exit_reason = None
+            if is_stale:
+                exit_reason = "STALE_DATA"
+            elif hold_edge < CONFIG.min_exit_edge:
+                exit_reason = "EDGE_COLLAPSE"
+            elif row["seconds_to_event_end"] is not None and row["seconds_to_event_end"] < CONFIG.time_stop_seconds:
+                exit_reason = "TIME_STOP"
+            elif row["resolved_outcome"] in ("UP", "DOWN"):
+                exit_reason = "RESOLVED"
+            if exit_reason:
+                exit_px = max(0.001, float(bid) - CONFIG.assumed_slippage_bps / 10_000.0)
+                pnl = (exit_px * existing.contracts) - existing.notional
+                won = pnl > 0
+                stats.trades += 1
+                stats.wins += int(won)
+                stats.losses += int(not won)
+                stats.total_notional += existing.notional
+                stats.realized_pnl += pnl
+                stats.entry_edges.append(existing.entry_edge)
+                stats.realized_edges.append(pnl / existing.notional if existing.notional else 0.0)
+                stats.holding_period_sec.append(max(0.0, (timestamp - existing.entry_time).total_seconds()))
+                stats.pnl_curve.append((stats.pnl_curve[-1] if stats.pnl_curve else 0.0) + pnl)
+                stats.pnl_by_asset[existing.asset] = stats.pnl_by_asset.get(existing.asset, 0.0) + pnl
+                stats.pnl_by_horizon[existing.horizon] = stats.pnl_by_horizon.get(existing.horizon, 0.0) + pnl
+                stats.pnl_by_side[existing.side] = stats.pnl_by_side.get(existing.side, 0.0) + pnl
+                stats.pnl_by_calibration_method[existing.calibration_method] = stats.pnl_by_calibration_method.get(existing.calibration_method, 0.0) + pnl
+                stats.exit_reasons[exit_reason] = stats.exit_reasons.get(exit_reason, 0) + 1
+                del open_by_event[event_key]
+            continue
+
+        if event_key in open_by_event or is_stale or ask is None or bid is None:
+            continue
+        if not (0 < float(ask) < 1) or spread is None or float(spread) > CONFIG.max_spread:
+            continue
+        if liquidity < CONFIG.min_liquidity:
+            continue
+        cal = calibrator.calibrate_side(row["asset"], row["horizon"], side, row["raw_synth_probability"])
+        entry_cost = (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0
+        net_ev = cal.fair_probability - float(ask) - entry_cost
+        if net_ev < CONFIG.min_entry_edge or cal.confidence_score < CONFIG.min_confidence_score:
+            continue
+        if len(open_by_event) >= CONFIG.max_open_positions:
+            continue
+        fill_px = min(0.999, float(ask) + CONFIG.assumed_slippage_bps / 10_000.0)
+        notional = CONFIG.bankroll_usd * CONFIG.max_position_size
+        contracts = notional / fill_px
+        open_by_event[event_key] = _ReplayPosition(
+            event_key=event_key,
+            asset=row["asset"],
+            horizon=row["horizon"],
+            side=side,
+            entry_time=timestamp,
+            entry_price=fill_px,
+            contracts=contracts,
+            notional=notional,
+            entry_edge=net_ev,
+            calibration_method=cal.calibration_method,
+        )
+        if spread is not None:
+            stats.spreads.append(float(spread))
+        stats.slippage_cost += CONFIG.assumed_slippage_bps / 10_000.0
+
+    stats.open_trades = len(open_by_event)
+    out = stats.summary()
+    out["source"] = "snapshot_replay"
+    out["snapshots"] = len(rows) if "rows" in locals() else 0
+    return out
