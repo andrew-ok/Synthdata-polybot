@@ -195,19 +195,30 @@ class Calibrator:
         self.observations = observations if observations is not None else load_observations()
         self._by_segment: Dict[Tuple[str, str], List[CalibrationObservation]] = defaultdict(list)
         self._by_segment_side: Dict[Tuple[str, str, str], List[CalibrationObservation]] = defaultdict(list)
+        self._global_by_side: Dict[str, List[CalibrationObservation]] = defaultdict(list)
         for row in self.observations:
             if row.realized_outcome in ("UP", "DOWN"):
                 self._by_segment[_segment_key(row.asset, row.horizon)].append(row)
                 self._by_segment_side[(row.asset.upper(), row.horizon, row.side.upper())].append(row)
+                self._global_by_side[row.side.upper()].append(row)
         self._metrics = segment_metrics(self.observations)
 
     def calibrate_side(self, asset: str, horizon: str, side: str, predicted_probability: float) -> CalibrationResult:
         p = _clamp(predicted_probability)
         side = side.upper()
+        # All fallback tiers filter to the same side so UP/DOWN observations are
+        # never mixed. A DOWN predicted_probability of 0.65 means something
+        # different from an UP predicted_probability of 0.65 (the equivalent
+        # DOWN probability would be 1 - 0.65 = 0.35), so cross-side rows cannot
+        # be compared directly in the same bin without transformation.
+        seg_same_side = [
+            r for r in self._by_segment.get(_segment_key(asset, horizon), [])
+            if r.side.upper() == side
+        ]
         candidates = [
             ("asset_horizon_side", self._by_segment_side.get((asset.upper(), horizon, side), []), CONFIG.min_calibration_samples_segment),
-            ("asset_horizon", self._by_segment.get(_segment_key(asset, horizon), []), CONFIG.min_calibration_samples_segment),
-            ("global", self.observations, CONFIG.min_calibration_samples_global),
+            ("asset_horizon_same_side", seg_same_side, CONFIG.min_calibration_samples_segment),
+            ("global_same_side", self._global_by_side.get(side, []), CONFIG.min_calibration_samples_global),
         ]
         for method, rows, min_samples in candidates:
             members = _bin_members(rows, p)

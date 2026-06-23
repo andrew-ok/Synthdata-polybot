@@ -124,10 +124,10 @@ def exposure_summary() -> Dict[str, Any]:
     }
 
 
-def open_position_from_fill(fill: Any, signal: Any) -> Position:
+def open_position_from_fill(fill: Any, signal: Any, position_id: Optional[str] = None) -> Position:
     now = datetime.now(timezone.utc).isoformat()
     position = Position(
-        position_id=str(uuid.uuid4()),
+        position_id=position_id or str(uuid.uuid4()),
         event_key=signal.event_key,
         condition_id=signal.condition_id,
         slug=signal.slug,

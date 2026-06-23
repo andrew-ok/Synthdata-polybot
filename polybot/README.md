@@ -46,10 +46,15 @@ or `realized_pnl`; unresolved paper trades are reported as open.
 
 ## Backtest
 
-Historical backtests spend Synth calls: `windows x assets x horizons`.
-For BTC/ETH/SOL/HYPE across 15M+1H, 24h is about 480 calls and 7d is about
-3,360 calls. Runs over `MAX_BACKTEST_CALLS_WITHOUT_CONFIRM` refuse to start
-unless explicitly confirmed, and every completed run is saved to
+There are two distinct backtest modes. They are not interchangeable.
+
+### Historical API backtest (`--backtest`)
+
+Calls the Synth API for past windows. Spends Synth API quota:
+`windows × assets × horizons`. For BTC/ETH/SOL/HYPE across 15M+1H, 24h is
+about 480 calls and 7d is about 3,360 calls. Runs over
+`MAX_BACKTEST_CALLS_WITHOUT_CONFIRM` refuse to start unless explicitly
+confirmed, and every completed run is saved to
 `polybot/logs/last_backtest.txt`.
 
 ```bash
@@ -58,14 +63,28 @@ CONFIRM_BACKTEST_SPEND=YES python -m polybot.scanner --backtest 2026-06-08T00:00
 ```
 
 Sweeps thresholds `{0.10, 0.15, 0.20, 0.25, 0.30}` and ranks by Sharpe proxy.
-Synth responses are cached under `polybot/data/synth_cache/` to avoid paying
-again for the same historical window during reruns.
+Synth responses are cached under `polybot/data/synth_cache/`. Useful for
+collecting calibration observations and rough threshold sweeps, but does not
+replay live Strategy B execution rules.
 
 Backtests only use final labels from `resolved_outcome` / `final_outcome` /
 `event_outcome` / `actual_outcome` by default. Set
 `ALLOW_CURRENT_OUTCOME_BACKTEST_LABEL=true` only when you have verified that
 Synth's `current_outcome` field is a final historical label for the endpoint
 being tested.
+
+### Snapshot replay (`--snapshot-backtest`)
+
+Replays the local `polybot/data/snapshots.sqlite3` database that accumulates
+during live scanner runs. This is the Strategy B backtest: each stored
+timestamp is treated as one atomic scan with the full execution pipeline:
+exits evaluated first (including MODEL_REVERSAL), then candidates scored,
+ranked, and capped by `MAX_TRADES_PER_SCAN`, then exposure limits enforced
+before opening positions. Requires accumulated snapshots from prior live runs.
+
+```bash
+python -m polybot.scanner --snapshot-backtest
+```
 
 ## Calibration
 
@@ -86,28 +105,35 @@ rate, and PnL by segment under `polybot/logs/calibration/`.
 | File | Responsibility |
 |---|---|
 | `config.py` | env-driven config, defaults, paper-mode lock |
-| `synth_client.py` | Synth API -> normalized `Opportunity` |
-| `polymarket_client.py` | Gamma metadata + CLOB best bid/ask + liquidity |
+| `synth_client.py` | Synth API → normalized `Opportunity` |
+| `polymarket_client.py` | Gamma metadata + real two-sided CLOB best bid/ask + liquidity |
+| `clob_enrichment.py` | fetches live CLOB books and enriches opportunities |
+| `event_identity.py` | derives stable `event_key` from market metadata |
 | `matcher.py` | legacy strict matcher for standalone Polymarket markets |
-| `signal_engine.py` | calibrated edge, net edge, and EV score per side |
-| `risk_manager.py` | spread/liquidity/correlation gates, sizing |
-| `execution.py` | paper fills with slippage; live trading stubbed |
-| `reports.py` | local Markdown/JSON daily paper-trade reports |
-| `calibration.py` | calibration database, reliability curves, segment metrics |
-| `exit_rules.py` | paper-position exit signal checks |
-| `backtester.py` | threshold sweep, win rate / EV / PnL / DD / Sharpe |
-| `dashboard.py` | CLI table of opportunities + rejection reasons |
+| `signal_engine.py` | calibrated fair probability, net edge, and EV score per side |
+| `risk_manager.py` | spread/liquidity/exposure gates, position sizing |
+| `calibration.py` | calibration observations, per-side reliability curves, segment metrics |
+| `snapshot_store.py` | writes every scanned opportunity side to `snapshots.sqlite3` |
+| `position_manager.py` | durable paper position ledger (event-log JSONL); tracks open/closed positions by `position_id` and `event_key` |
+| `exit_rules.py` | Strategy B exit checks: STALE_DATA, EDGE_COLLAPSE, MODEL_REVERSAL, RANK_DECAY, TIME_STOP |
+| `execution.py` | paper fills with slippage; links fills to positions via `position_id`; live trading stubbed |
+| `reports.py` | local Markdown/JSON daily reports, Strategy B positions/exposure/edge-decay reports |
+| `backtester.py` | historical API backtest (threshold sweep) and snapshot replay (Strategy B rules) |
+| `dashboard.py` | CLI ranked table of opportunities + rejection reasons |
 | `scanner.py` | entrypoint |
 
 ## Safety rails
 
-- `PAPER_TRADE_MODE=true` is enforced in `execution.paper_fill`.
-- `place_live_limit_order` raises `NotImplementedError`.
+- `PAPER_TRADE_MODE=true` is enforced at every fill; `assert_paper_only()` raises if the flag is unset.
+- `place_live_limit_order` raises `NotImplementedError` — live order placement is not implemented.
 - Marketable orders are blocked unless `ALLOW_MARKETABLE_ORDERS=true`.
-- The fills ledger blocks repeat entries on the same event contract after a
-  position has already been opened.
-- Correlated-event gate prevents stacking multiple markets on the same name.
-- Min-hours-to-resolution avoids last-minute info-risk markets.
+- `REQUIRE_REAL_TWO_SIDED_CLOB=true` (default) rejects opportunities without a real NO-side CLOB.
+- `ALLOW_COMPLEMENTARY_BOOK_FALLBACK=false` (default) prevents using `1 - YES_bid` as a synthetic NO ask.
+- The position manager blocks duplicate open positions on the same `event_key` before writing any fill.
+- Exposure gates enforce `MAX_TOTAL_EXPOSURE`, `MAX_ASSET_EXPOSURE`, `MAX_HORIZON_EXPOSURE`, and `MAX_OPEN_POSITIONS` per scan.
+- `MAX_TRADES_PER_SCAN` caps new entries per scan cycle.
+- Position cooldown (`POSITION_COOLDOWN_SECONDS`) prevents rapid re-entry after a close.
+- All fills and positions are linked by `position_id` for clean traceability across `fills.jsonl` and `positions.jsonl`.
 
 ## Notes on Synth endpoints
 

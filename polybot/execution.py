@@ -10,6 +10,7 @@ import csv
 import json
 import logging
 import os
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
@@ -56,6 +57,7 @@ class Fill:
     exit_reason: Optional[str]
     market_question: str
     mode: str            # "paper" or "live"
+    position_id: Optional[str] = None
 
 
 def _slippage_adjusted_ask(ask: float) -> float:
@@ -90,7 +92,7 @@ def log_skip(decision: Decision) -> None:
     })
 
 
-def paper_fill(decision: Decision) -> Fill:
+def paper_fill(decision: Decision, position_id: Optional[str] = None) -> Fill:
     CONFIG.assert_paper_only()
     sig = decision.signal
     if has_open_event(sig.event_key):
@@ -132,6 +134,7 @@ def paper_fill(decision: Decision) -> Fill:
         exit_reason=None,
         market_question=sig.market_question,
         mode="paper",
+        position_id=position_id,
     )
 
     log_dir = _ensure_logdir()
@@ -154,12 +157,13 @@ def execute_decisions(decisions: Iterable[Decision]) -> List[Fill]:
             log_skip(d)
             continue
         try:
-            fill = paper_fill(d)
+            pos_id = str(uuid.uuid4())
+            fill = paper_fill(d, position_id=pos_id)
         except RuntimeError as exc:
             log.warning("%s", exc)
             log_skip(Decision(d.signal, False, str(exc)))
             continue
-        open_position_from_fill(fill, d.signal)
+        open_position_from_fill(fill, d.signal, position_id=pos_id)
         fills.append(fill)
     if fills:
         write_daily_report()

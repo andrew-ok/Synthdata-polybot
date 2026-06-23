@@ -1,13 +1,14 @@
-"""Scanner entrypoint.
+"""Scanner entrypoint — Strategy B paper-trading scanner.
 
-Pulls pre-matched Synth+Polymarket opportunities for {BTC, ETH, SOL, HYPE}
-across the 15M and 1H horizons, runs the signal engine + risk gates, and
-prints the ranked table. Paper trading only.
+Fetches live Synth forecasts + real two-sided CLOB data, writes snapshots,
+evaluates exits on open positions, scores and ranks entry candidates, and
+(with --execute) writes paper fills linked to positions by position_id.
 
 Usage:
-    python -m polybot.scanner
-    python -m polybot.scanner --show-skipped
-    python -m polybot.scanner --execute
+    python -m polybot.scanner                    # dry run: ranked table only
+    python -m polybot.scanner --show-skipped     # include rejection reasons
+    python -m polybot.scanner --execute          # evaluate exits + write fills
+    python -m polybot.scanner --snapshot-backtest  # replay snapshots.sqlite3
     python -m polybot.scanner --backtest 2026-06-10T00:00:00Z 2026-06-14T00:00:00Z
 """
 from __future__ import annotations
@@ -80,7 +81,7 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
         write_strategy_b_reports()
         log.info("Paper-trade fills written: %d (see %s)", len(fills), CONFIG.log_dir)
 
-    return 0 if accepted else 1
+    return 0
 
 
 def run_backtest_cli(start: str, end: str) -> int:
@@ -212,7 +213,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_backtest_cli(*args.backtest)
     if args.snapshot_backtest:
         from .backtester import run_snapshot_backtest
-        print(run_snapshot_backtest())
+        result = run_snapshot_backtest()
+        print(f"\n=== SNAPSHOT REPLAY BACKTEST (Strategy B) ===")
+        print(f"Source: {result.get('source', 'snapshot_replay')}")
+        print(f"Snapshots replayed: {result.get('snapshots', 0)}")
+        print(f"Trades: {result['trades']}  Wins: {result['wins']}  Losses: {result['losses']}  Open: {result['open_trades']}")
+        print(f"Win rate: {result['win_rate']:.2%}  Realized PnL: ${result['realized_pnl']:.2f}  ROI: {result['roi']:.2%}")
+        print(f"Max drawdown: ${result['max_drawdown']:.2f}  Sharpe proxy: {result['sharpe_proxy']:.3f}")
+        if result['exit_reasons']:
+            print(f"Exit reasons: {result['exit_reasons']}")
+        if result.get('note'):
+            print(f"Note: {result['note']}")
+        print()
         return 0
     return run_scan(args.execute, args.show_skipped, args.limit, args.kelly)
 
