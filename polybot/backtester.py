@@ -35,27 +35,48 @@ class _Stats:
     threshold: float
     trades: int = 0
     wins: int = 0
+    losses: int = 0
+    open_trades: int = 0
     total_ev: float = 0.0
+    total_notional: float = 0.0
     realized_pnl: float = 0.0
+    entry_edges: List[float] = field(default_factory=list)
+    realized_edges: List[float] = field(default_factory=list)
     spreads: List[float] = field(default_factory=list)
     slippage_cost: float = 0.0
     holding_period_sec: List[float] = field(default_factory=list)
     pnl_curve: List[float] = field(default_factory=list)
+    pnl_by_asset: Dict[str, float] = field(default_factory=dict)
+    pnl_by_horizon: Dict[str, float] = field(default_factory=dict)
+    pnl_by_side: Dict[str, float] = field(default_factory=dict)
+    pnl_by_calibration_method: Dict[str, float] = field(default_factory=dict)
+    exit_reasons: Dict[str, int] = field(default_factory=dict)
 
-    def summary(self) -> Dict[str, float]:
+    def summary(self) -> Dict[str, object]:
         wr = self.wins / self.trades if self.trades else 0.0
         avg_ev = self.total_ev / self.trades if self.trades else 0.0
         return {
             "threshold": self.threshold,
             "trades": self.trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "open_trades": self.open_trades,
             "win_rate": round(wr, 4),
             "avg_EV": round(avg_ev, 4),
             "realized_pnl": round(self.realized_pnl, 2),
+            "roi": round(self.realized_pnl / self.total_notional, 4) if self.total_notional else 0.0,
             "max_drawdown": round(_max_drawdown(self.pnl_curve), 2),
+            "avg_entry_edge": round(sum(self.entry_edges) / len(self.entry_edges), 4) if self.entry_edges else 0.0,
+            "avg_realized_edge": round(sum(self.realized_edges) / len(self.realized_edges), 4) if self.realized_edges else 0.0,
             "avg_spread": round(sum(self.spreads) / len(self.spreads), 4) if self.spreads else 0.0,
             "avg_slippage_cost": round(self.slippage_cost / self.trades, 4) if self.trades else 0.0,
             "avg_holding_period_sec": round(sum(self.holding_period_sec) / len(self.holding_period_sec), 2) if self.holding_period_sec else 0.0,
             "sharpe_proxy": round(_sharpe_proxy(self.pnl_curve), 3),
+            "pnl_by_asset": {k: round(v, 4) for k, v in sorted(self.pnl_by_asset.items())},
+            "pnl_by_horizon": {k: round(v, 4) for k, v in sorted(self.pnl_by_horizon.items())},
+            "pnl_by_side": {k: round(v, 4) for k, v in sorted(self.pnl_by_side.items())},
+            "pnl_by_calibration_method": {k: round(v, 4) for k, v in sorted(self.pnl_by_calibration_method.items())},
+            "exit_reasons": dict(sorted(self.exit_reasons.items())),
         }
 
 
@@ -135,14 +156,23 @@ def _process_signal(stats: _Stats, sig, resolved_up: bool, holding_period_sec: f
 
     stats.trades += 1
     stats.wins += int(won)
+    stats.losses += int(not won)
     stats.total_ev += ev
+    stats.total_notional += notional
     stats.realized_pnl += pnl
+    stats.entry_edges.append(sig.net_edge)
+    stats.realized_edges.append((1.0 - fill_px) if won else -fill_px)
     stats.slippage_cost += slip
     stats.holding_period_sec.append(max(0.0, holding_period_sec))
     if sig.spread is not None:
         stats.spreads.append(float(sig.spread))
     running = (stats.pnl_curve[-1] if stats.pnl_curve else 0.0) + pnl
     stats.pnl_curve.append(running)
+    stats.pnl_by_asset[sig.asset] = stats.pnl_by_asset.get(sig.asset, 0.0) + pnl
+    stats.pnl_by_horizon[sig.horizon] = stats.pnl_by_horizon.get(sig.horizon, 0.0) + pnl
+    stats.pnl_by_side[sig.side] = stats.pnl_by_side.get(sig.side, 0.0) + pnl
+    stats.pnl_by_calibration_method[sig.calibration_method] = stats.pnl_by_calibration_method.get(sig.calibration_method, 0.0) + pnl
+    stats.exit_reasons["RESOLVED"] = stats.exit_reasons.get("RESOLVED", 0) + 1
 
 
 def run_backtest(
@@ -152,7 +182,7 @@ def run_backtest(
     horizons: Optional[List[str]] = None,
     thresholds: Optional[Iterable[float]] = None,
     request_delay_sec: float = 0.0,
-) -> List[Dict[str, float]]:
+) -> List[Dict[str, object]]:
     assets = assets or CONFIG.synth_assets
     horizons = horizons or configured_horizons()
     thresholds = list(thresholds or CONFIG.backtest_thresholds)
@@ -214,7 +244,7 @@ def run_backtest(
                                 timestamp=iso,
                                 asset=asset,
                                 horizon=horizon,
-                                predicted_probability=opp.synth_probability_up,
+                                predicted_probability=sig.raw_synth_probability,
                                 realized_outcome="UP" if resolved_up else "DOWN",
                                 ask_price=sig.execution_price,
                                 side=sig.side,
@@ -236,7 +266,7 @@ def run_backtest(
     return results
 
 
-def best_threshold(results: List[Dict[str, float]]) -> Optional[float]:
+def best_threshold(results: List[Dict[str, object]]) -> Optional[float]:
     if not results:
         return None
     return results[0]["threshold"]

@@ -190,6 +190,11 @@ def evaluate(
             continue
         if not event_key_for_opportunity(opp):
             continue
+        yes_ask_check = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
+        if yes_ask_check is not None and opp.no_ask_price is not None:
+            ask_sum = yes_ask_check + opp.no_ask_price
+            if ask_sum < 0.90 or ask_sum > 1.15:
+                continue
 
         # --- Up leg ---
         yes_bid = opp.yes_bid_price if opp.yes_bid_price is not None else opp.best_bid_price

@@ -18,12 +18,14 @@ _COLS = [
     ("Edge(net)",  10),
     ("Synth p",     8),
     ("Cal p",       8),
+    ("Conf",        7),
+    ("Score",       8),
     ("Ask",         7),
     ("Spread",      7),
     ("Liq($)",      9),
     ("Size($)",     8),
     ("Status",     10),
-    ("Slug",       38),
+    ("Event",      38),
 ]
 
 
@@ -58,12 +60,14 @@ def _print_plain(decisions: List[Decision], show_skipped: bool, limit: int) -> N
             _fmt(s.net_edge),
             _fmt(s.synth_probability),
             _fmt(getattr(s, "calibrated_probability", s.synth_probability)),
+            _fmt(getattr(s, "confidence_score", 0.0)),
+            _fmt(getattr(s, "score", 0.0)),
             _fmt(s.execution_price),
             _fmt(s.spread),
             f"{s.liquidity:,.0f}" if s.liquidity else "—",
             f"{d.position_size_usd:,.2f}" if d.accepted else "—",
             "ACCEPT" if d.accepted else "skip",
-            _truncate(getattr(s, "slug", s.market_question), 38),
+            _truncate(getattr(s, "event_key", getattr(s, "slug", s.market_question)), 38),
         ]
         line = " | ".join(f"{cell:<{width}}" for cell, (_, width) in zip(row, _COLS))
         # Append reason for skipped trades so the user sees *why*.
@@ -76,7 +80,7 @@ def _print_plain(decisions: List[Decision], show_skipped: bool, limit: int) -> N
 
 
 def render(decisions: Iterable[Decision], show_skipped: bool = False, limit: int = 25) -> None:
-    decisions = sorted(decisions, key=lambda d: (not d.accepted, -d.signal.net_edge))
+    decisions = sorted(decisions, key=lambda d: (not d.accepted, -getattr(d.signal, "score", d.signal.net_edge)))
     try:
         from rich.console import Console
         from rich.table import Table
@@ -108,12 +112,14 @@ def render(decisions: Iterable[Decision], show_skipped: bool = False, limit: int
             f"[bold]{_fmt(s.net_edge)}[/bold]",
             _fmt(s.synth_probability),
             _fmt(getattr(s, "calibrated_probability", s.synth_probability)),
+            _fmt(getattr(s, "confidence_score", 0.0)),
+            _fmt(getattr(s, "score", 0.0)),
             _fmt(s.execution_price),
             _fmt(s.spread),
             f"{s.liquidity:,.0f}" if s.liquidity else "—",
             f"${d.position_size_usd:,.2f}" if d.accepted else "—",
             f"[{status_style}]{'ACCEPT' if d.accepted else 'skip'}[/{status_style}]",
-            _truncate(getattr(s, "slug", s.market_question), 38),
+            _truncate(getattr(s, "event_key", getattr(s, "slug", s.market_question)), 38),
             _truncate(d.reason, 40),
         )
         shown += 1

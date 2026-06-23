@@ -145,12 +145,17 @@ def _live_scan() -> Dict[str, Any]:
             "net_edge": round(s.net_edge, 4),
             "model_confidence": round(getattr(s, "model_confidence", 0.0), 4),
             "expected_value_score": round(getattr(s, "expected_value_score", s.net_edge), 4),
+            "confidence_score": round(getattr(s, "confidence_score", 0.0), 4),
+            "liquidity_score": round(getattr(s, "liquidity_score", 0.0), 4),
+            "regime_score": round(getattr(s, "regime_score", 1.0), 4),
+            "score": round(getattr(s, "score", s.net_edge), 4),
             "spread": s.spread,
             "liquidity": round(s.liquidity, 2),
             "size_usd": round(d.position_size_usd, 2) if d.accepted else None,
             "status": "ACCEPT" if d.accepted else "skip",
             "reason": d.reason,
             "slug": getattr(s, "slug", ""),
+            "event_key": getattr(s, "event_key", ""),
             "market_url": getattr(s, "market_url", ""),
         }
 
@@ -177,8 +182,8 @@ def api_state():
             "config": {
                 "paper_mode": CONFIG.paper_trade_mode,
                 "bankroll_usd": CONFIG.bankroll_usd,
-                "min_edge_threshold": CONFIG.min_edge_threshold,
-                "min_net_edge_threshold": CONFIG.min_net_edge_threshold,
+                "min_entry_edge": CONFIG.min_entry_edge,
+                "min_exit_edge": CONFIG.min_exit_edge,
                 "assets": CONFIG.synth_assets,
                 "horizons": configured_horizons(),
             },
@@ -269,8 +274,8 @@ _HTML = r"""
   <div class="card" style="overflow-x:auto;">
     <table id="acceptedTbl">
       <thead><tr>
-        <th>Asset</th><th>Horizon</th><th>Side</th><th>Synth p</th><th>Ask</th>
-        <th>Raw edge</th><th>Net edge</th><th>Spread</th><th>Liquidity ($)</th><th>Size ($)</th><th>Slug</th>
+        <th>Asset</th><th>Horizon</th><th>Side</th><th>Synth p</th><th>Fair p</th><th>Ask</th>
+        <th>Raw edge</th><th>Net edge</th><th>Conf</th><th>Score</th><th>Spread</th><th>Liquidity ($)</th><th>Size ($)</th><th>Event</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -280,8 +285,8 @@ _HTML = r"""
   <div class="card" style="overflow-x:auto;">
     <table id="skippedTbl">
       <thead><tr>
-        <th>Asset</th><th>Horizon</th><th>Side</th><th>Synth p</th><th>Ask</th>
-        <th>Raw edge</th><th>Net edge</th><th>Spread</th><th>Liquidity ($)</th><th>Reason</th>
+        <th>Asset</th><th>Horizon</th><th>Side</th><th>Synth p</th><th>Fair p</th><th>Ask</th>
+        <th>Raw edge</th><th>Net edge</th><th>Conf</th><th>Score</th><th>Spread</th><th>Liquidity ($)</th><th>Reason</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -300,7 +305,7 @@ function pnlClass(v) { return v>0 ? "good" : (v<0 ? "bad" : ""); }
 
 function renderRows(tbody, rows, includeSize) {
   if (!rows || !rows.length) {
-    tbody.innerHTML = `<tr><td colspan="11" style="color:var(--muted);text-align:center;padding:18px">no rows</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="13" style="color:var(--muted);text-align:center;padding:18px">no rows</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map(r => {
@@ -308,16 +313,19 @@ function renderRows(tbody, rows, includeSize) {
       ? '<span class="pill yes">YES</span>'
       : '<span class="pill no">NO</span>';
     const lastCol = includeSize
-      ? `<td>${money(r.size_usd)}</td><td class="truncate" title="${r.slug||''}">${r.market_url ? `<a href="${r.market_url}" target="_blank" rel="noreferrer">${r.slug||''}</a>` : (r.slug||'')}</td>`
+      ? `<td>${money(r.size_usd)}</td><td class="truncate" title="${r.event_key||r.slug||''}">${r.market_url ? `<a href="${r.market_url}" target="_blank" rel="noreferrer">${r.event_key||r.slug||''}</a>` : (r.event_key||r.slug||'')}</td>`
       : `<td class="truncate" title="${r.reason||''}">${r.reason||''}</td>`;
     return `<tr>
       <td>${r.asset||"-"}</td>
       <td>${r.horizon||"-"}</td>
       <td>${side}</td>
       <td>${num(r.synth_p)}</td>
+      <td>${num(r.calibrated_p)}</td>
       <td>${num(r.ask)}</td>
       <td>${num(r.raw_edge)}</td>
       <td><b>${num(r.net_edge)}</b></td>
+      <td>${num(r.confidence_score,3)}</td>
+      <td><b>${num(r.score,4)}</b></td>
       <td>${num(r.spread,3)}</td>
       <td>${money(r.liquidity)}</td>
       ${lastCol}
@@ -350,7 +358,7 @@ async function refresh() {
   const cfg = data.config, perf = data.perf, live = data.live;
 
   document.getElementById("meta").textContent =
-    `assets=${cfg.assets.join("/")} · horizons=${cfg.horizons.join(",")} · raw≥${cfg.min_edge_threshold} · net≥${cfg.min_net_edge_threshold} · bankroll $${cfg.bankroll_usd}` +
+    `assets=${cfg.assets.join("/")} · horizons=${cfg.horizons.join(",")} · entry edge≥${cfg.min_entry_edge} · exit edge≥${cfg.min_exit_edge} · bankroll $${cfg.bankroll_usd}` +
     (cfg.paper_mode ? " · PAPER" : " · LIVE");
   document.getElementById("asof").textContent = "as of " + (live.as_of || new Date().toISOString());
 
