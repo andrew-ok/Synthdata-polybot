@@ -123,6 +123,17 @@ def run_backtest_cli(start: str, end: str) -> int:
             rows.append(" | ".join(f"{r[c]:>14}" for c in cols))
         rows.append("")
         rows.append(f"Best threshold by Sharpe proxy: {best_threshold(results)}")
+        if results:
+            rs = results[0].get("resolution_stats", {})
+            if rs:
+                rows.append("")
+                rows.append("Label resolution breakdown:")
+                rows.append(f"  synth resolved:    {rs.get('labels_synth', 0)}")
+                rows.append(f"  gamma_prices:      {rs.get('labels_gamma_prices', 0)}")
+                rows.append(f"  gamma_winner:      {rs.get('labels_gamma_winner', 0)}")
+                rows.append(f"  gamma_unresolved:  {rs.get('gamma_unresolved', 0)}")
+                rows.append(f"  gamma_errors:      {rs.get('gamma_errors', 0)}")
+                rows.append(f"  cache_hits:        {rs.get('gamma_cache_hits', 0)}")
         rows.append(f"Backtest finished: {datetime.now(timezone.utc).isoformat()}")
         _write_and_print(out_path, rows)
         print(f"\nSaved to {out_path}")

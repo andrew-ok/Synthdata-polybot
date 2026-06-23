@@ -30,6 +30,8 @@ from typing import Dict, Iterable, List, Optional
 
 from .config import CONFIG
 from .calibration import CalibrationObservation, Calibrator, append_observation
+from .gamma_resolver import resolve_final_outcome_from_gamma
+from .polymarket_client import PolymarketClient
 from .signal_engine import evaluate
 from .synth_client import INSIGHTS_PATHS, SynthInsightsClient, configured_horizons
 
@@ -201,10 +203,17 @@ def run_backtest(
     end = datetime.fromisoformat(end_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
 
     client = SynthInsightsClient()
+    gamma_client = PolymarketClient()
     calibrator = Calibrator()
     total_pulled = 0
     skipped_late = 0
     skipped_unresolved = 0
+    labels_synth = 0
+    labels_gamma_prices = 0
+    labels_gamma_winner = 0
+    gamma_unresolved = 0
+    gamma_errors = 0
+    gamma_cache_hits = 0
 
     for horizon in horizons:
         step = _HORIZON_STEP_SEC.get(horizon)
@@ -228,8 +237,27 @@ def run_backtest(
                     skipped_late += 1
                     continue
                 label = opp.resolved_outcome
-                if label is None and CONFIG.allow_current_outcome_backtest_label:
-                    label = opp.current_outcome
+                if label is not None:
+                    labels_synth += 1
+                else:
+                    gamma_label, gamma_src, _gamma_reason = resolve_final_outcome_from_gamma(
+                        opp.slug, gamma_client
+                    )
+                    if gamma_label is not None:
+                        label = gamma_label
+                        if gamma_src.startswith("cache:"):
+                            gamma_cache_hits += 1
+                        base = gamma_src.replace("cache:", "")
+                        if base == "gamma_prices":
+                            labels_gamma_prices += 1
+                        else:
+                            labels_gamma_winner += 1
+                    elif gamma_src in ("gamma_error",):
+                        gamma_errors += 1
+                    elif gamma_src not in ("no_slug",):
+                        gamma_unresolved += 1
+                    if label is None and CONFIG.allow_current_outcome_backtest_label:
+                        label = opp.current_outcome or None
                 outcome = str(label or "").strip().lower()
                 if outcome not in ("up", "down"):
                     skipped_unresolved += 1
@@ -263,15 +291,34 @@ def run_backtest(
                         _process_signal(stats[t], sig, resolved_up, holding_period_sec)
 
     log.info(
-        "Backtest pulled %d opportunities; skipped %d late snapshots (> %.0fs after event start); skipped %d unresolved labels",
+        "Backtest pulled %d opportunities; skipped %d late; skipped %d unresolved",
         total_pulled,
         skipped_late,
-        CONFIG.max_backtest_snapshot_lag_sec,
         skipped_unresolved,
     )
+    log.info(
+        "Labels: synth=%d gamma_prices=%d gamma_winner=%d | "
+        "gamma_unresolved=%d gamma_errors=%d cache_hits=%d",
+        labels_synth,
+        labels_gamma_prices,
+        labels_gamma_winner,
+        gamma_unresolved,
+        gamma_errors,
+        gamma_cache_hits,
+    )
 
+    resolution_stats = {
+        "labels_synth": labels_synth,
+        "labels_gamma_prices": labels_gamma_prices,
+        "labels_gamma_winner": labels_gamma_winner,
+        "gamma_unresolved": gamma_unresolved,
+        "gamma_errors": gamma_errors,
+        "gamma_cache_hits": gamma_cache_hits,
+    }
     results = [stats[t].summary() for t in thresholds]
     results.sort(key=lambda r: (r["sharpe_proxy"], r["realized_pnl"]), reverse=True)
+    for r in results:
+        r["resolution_stats"] = resolution_stats
     return results
 
 
