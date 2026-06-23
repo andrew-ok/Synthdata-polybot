@@ -263,13 +263,23 @@ def run_backtest(
                     skipped_unresolved += 1
                     continue
                 resolved_up = outcome == "up"
-                append_observation(CalibrationObservation(
+                _base_kwargs = dict(
                     timestamp=iso,
                     asset=asset,
                     horizon=horizon,
+                    source="backtest",
+                )
+                append_observation(CalibrationObservation(
                     predicted_probability=opp.synth_probability_up,
                     realized_outcome="UP" if resolved_up else "DOWN",
-                    source="backtest",
+                    side="UP",
+                    **_base_kwargs,
+                ))
+                append_observation(CalibrationObservation(
+                    predicted_probability=opp.synth_probability_down,
+                    realized_outcome="UP" if resolved_up else "DOWN",
+                    side="DOWN",
+                    **_base_kwargs,
                 ))
                 holding_period_sec = (opp.event_end_time - opp.current_time).total_seconds()
 
