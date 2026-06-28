@@ -188,6 +188,28 @@ def _process_signal(stats: _Stats, sig, resolved_up: bool, holding_period_sec: f
     stats.exit_reasons["RESOLVED"] = stats.exit_reasons.get("RESOLVED", 0) + 1
 
 
+def _conviction_bucket(p: float) -> str:
+    """Return a conviction bucket label for a raw Synth probability."""
+    dist = max(p, 1.0 - p)  # distance from 0.5, i.e. how confident (always >= 0.5)
+    if dist >= 0.90:
+        return "90%+"
+    if dist >= 0.85:
+        return "85-90%"
+    if dist >= 0.80:
+        return "80-85%"
+    if dist >= 0.75:
+        return "75-80%"
+    if dist >= 0.70:
+        return "70-75%"
+    if dist >= 0.65:
+        return "65-70%"
+    if dist >= 0.60:
+        return "60-65%"
+    if dist >= 0.55:
+        return "55-60%"
+    return "50-55%"
+
+
 def run_backtest(
     start_iso: str,
     end_iso: str,
@@ -200,6 +222,10 @@ def run_backtest(
     horizons = horizons or configured_horizons()
     thresholds = list(thresholds or CONFIG.backtest_thresholds)
     stats = {t: _Stats(threshold=t) for t in thresholds}
+
+    # Conviction-bucket calibration: track Synth's raw hit rate by probability level,
+    # independent of edge requirements. Reveals where Synth's alpha actually lives.
+    conviction_buckets: Dict[str, Dict[str, int]] = {}
 
     start = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
     end = datetime.fromisoformat(end_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -265,6 +291,15 @@ def run_backtest(
                     skipped_unresolved += 1
                     continue
                 resolved_up = outcome == "up"
+
+                # Conviction-bucket: record whether Synth's predicted side won.
+                synth_said_up = opp.synth_probability_up >= 0.5
+                synth_correct = (synth_said_up and resolved_up) or (not synth_said_up and not resolved_up)
+                bucket = _conviction_bucket(opp.synth_probability_up)
+                b = conviction_buckets.setdefault(bucket, {"wins": 0, "total": 0})
+                b["total"] += 1
+                b["wins"] += int(synth_correct)
+
                 _base_kwargs = dict(
                     timestamp=iso,
                     asset=asset,
@@ -327,10 +362,21 @@ def run_backtest(
         "gamma_errors": gamma_errors,
         "gamma_cache_hits": gamma_cache_hits,
     }
+    # Compute conviction win-rate for each bucket.
+    conviction_summary = {
+        bucket: {
+            "total": b["total"],
+            "wins": b["wins"],
+            "win_rate": round(b["wins"] / b["total"], 4) if b["total"] else 0.0,
+        }
+        for bucket, b in sorted(conviction_buckets.items())
+    }
+
     results = [stats[t].summary() for t in thresholds]
     results.sort(key=lambda r: (r["sharpe_proxy"], r["realized_pnl"]), reverse=True)
     for r in results:
         r["resolution_stats"] = resolution_stats
+        r["conviction_calibration"] = conviction_summary
     return results
 
 

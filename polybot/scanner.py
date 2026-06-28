@@ -157,6 +157,17 @@ def run_backtest_cli(start: str, end: str) -> int:
         rows.append("")
         rows.append(f"Best threshold by Sharpe proxy: {best_threshold(results)}")
         if results:
+            cc = results[0].get("conviction_calibration", {})
+            if cc:
+                rows.append("")
+                rows.append("Synth conviction calibration (raw hit rate by confidence level):")
+                rows.append(f"  {'Bucket':<12}  {'Total':>6}  {'Wins':>6}  {'WinRate':>8}")
+                rows.append(f"  {'-'*12}  {'-'*6}  {'-'*6}  {'-'*8}")
+                for bucket in ["50-55%", "55-60%", "60-65%", "65-70%", "70-75%",
+                               "75-80%", "80-85%", "85-90%", "90%+"]:
+                    b = cc.get(bucket)
+                    if b:
+                        rows.append(f"  {bucket:<12}  {b['total']:>6}  {b['wins']:>6}  {b['win_rate']:>8.1%}")
             rs = results[0].get("resolution_stats", {})
             if rs:
                 rows.append("")
@@ -231,11 +242,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Print a dry-run strategy health report: config, exposure, recent signals, exits")
     p.add_argument("--loop", action="store_true",
                    help="Run continuously until Ctrl-C")
-    p.add_argument("--interval-seconds", type=int, default=600,
-                   help="Seconds between scans when --loop is used (default 600 / 10 min). "
-                        "Synth API costs 1 token per (asset × horizon) call. "
-                        "BTC+ETH × 2 horizons = 4 calls/scan → ~17k tokens/month at 10 min. "
-                        "Adding SOL/HYPE doubles to 8 calls/scan. Minimum enforced: 60s.")
+    p.add_argument("--interval-seconds", type=int, default=360,
+                   help="Seconds between scans when --loop is used (default 360 / 6 min). "
+                        "Synth forecasts refresh every 3 min; 6 min captures every other update. "
+                        "BTC+ETH × 2 horizons = 4 calls/scan → ~29k tokens/month at 6 min. "
+                        "Use 540s to stay within a 20k/month token budget. Minimum enforced: 60s.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 

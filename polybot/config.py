@@ -72,7 +72,9 @@ class Config:
     # Synth is only slightly above the coin-flip line. Set 0.0 to disable.
     # Recommended: 0.68 (only trade when Synth says >68% or <32%).
     min_synth_conviction: float = field(default_factory=lambda: _env_float("MIN_SYNTH_CONVICTION", 0.68))
-    backtest_thresholds: tuple = (0.03, 0.05, 0.07, 0.10, 0.15, 0.20)
+    # Edge thresholds swept in the historical API backtest.
+    # Covers below and above our live min_entry_edge=0.08 to show where alpha starts.
+    backtest_thresholds: tuple = (0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20)
     # Per-asset edge overrides: can require wider net edge for thinner books.
     # Empty by default since we only trade BTC and ETH (liquid markets).
     # Set THIN_MARKET_ASSETS=HYPE,SOL if those assets are re-enabled.
@@ -162,7 +164,9 @@ class Config:
     allow_complementary_book_fallback: bool = field(default_factory=lambda: _env_bool("ALLOW_COMPLEMENTARY_BOOK_FALLBACK", False))
     max_synth_staleness_sec: float = field(default_factory=lambda: _env_float("MAX_SYNTH_STALENESS_SEC", 90.0))
     max_clob_staleness_sec: float = field(default_factory=lambda: _env_float("MAX_CLOB_STALENESS_SEC", 30.0))
-    max_backtest_snapshot_lag_sec: float = field(default_factory=lambda: _env_float("MAX_BACKTEST_SNAPSHOT_LAG_SEC", 90.0))
+    # Synth posts data 2-3 minutes after window open, so any lag under 750s (the
+    # full usable entry window for 15M) is valid. 90s was skipping all historical data.
+    max_backtest_snapshot_lag_sec: float = field(default_factory=lambda: _env_float("MAX_BACKTEST_SNAPSHOT_LAG_SEC", 750.0))
     allow_current_outcome_backtest_label: bool = field(default_factory=lambda: _env_bool("ALLOW_CURRENT_OUTCOME_BACKTEST_LABEL", False))
 
     # --- Calibration / segment risk ---
