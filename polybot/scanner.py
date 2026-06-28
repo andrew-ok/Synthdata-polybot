@@ -231,10 +231,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Print a dry-run strategy health report: config, exposure, recent signals, exits")
     p.add_argument("--loop", action="store_true",
                    help="Run continuously until Ctrl-C")
-    p.add_argument("--interval-seconds", type=int, default=300,
-                   help="Seconds between scans when --loop is used (default 300 / 5 min). "
-                        "Synth API costs 2 tokens per cycle (one per horizon). "
-                        "At 20k tokens/month the safe floor is ~260s. Minimum enforced: 60s.")
+    p.add_argument("--interval-seconds", type=int, default=600,
+                   help="Seconds between scans when --loop is used (default 600 / 10 min). "
+                        "Synth API costs 1 token per (asset × horizon) call. "
+                        "BTC+ETH × 2 horizons = 4 calls/scan → ~17k tokens/month at 10 min. "
+                        "Adding SOL/HYPE doubles to 8 calls/scan. Minimum enforced: 60s.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 

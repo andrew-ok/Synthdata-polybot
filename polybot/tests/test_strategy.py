@@ -24,18 +24,6 @@ class TestFeeModel(unittest.TestCase):
 
 
 class TestThresholds(unittest.TestCase):
-    def test_hype_uses_thin_market_edge(self):
-        from polybot.signal_engine import _effective_threshold
-        from polybot.config import CONFIG
-        thr = _effective_threshold("HYPE", 0.03)
-        self.assertEqual(thr, CONFIG.thin_market_min_edge)
-
-    def test_sol_uses_thin_market_edge(self):
-        from polybot.signal_engine import _effective_threshold
-        from polybot.config import CONFIG
-        thr = _effective_threshold("SOL", 0.03)
-        self.assertEqual(thr, CONFIG.thin_market_min_edge)
-
     def test_btc_uses_normal_threshold(self):
         from polybot.signal_engine import _effective_threshold
         thr = _effective_threshold("BTC", 0.05)
@@ -45,6 +33,17 @@ class TestThresholds(unittest.TestCase):
         from polybot.signal_engine import _effective_threshold
         thr = _effective_threshold("ETH", 0.07)
         self.assertEqual(thr, 0.07)
+
+    def test_thin_market_override_works_when_configured(self):
+        """thin_market_assets is empty by default (BTC+ETH only). If re-enabled, the
+        wider edge applies. Verify the override mechanism still works correctly."""
+        from polybot.signal_engine import _effective_threshold
+        from polybot.config import CONFIG
+        from unittest.mock import patch
+        with patch.object(CONFIG, "thin_market_assets", ["HYPE", "SOL"]):
+            self.assertEqual(_effective_threshold("HYPE", 0.03), CONFIG.thin_market_min_edge)
+            self.assertEqual(_effective_threshold("SOL",  0.03), CONFIG.thin_market_min_edge)
+            self.assertEqual(_effective_threshold("BTC",  0.03), 0.03)
 
 
 class TestEntryCost(unittest.TestCase):

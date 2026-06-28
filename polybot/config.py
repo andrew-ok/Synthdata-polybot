@@ -73,9 +73,11 @@ class Config:
     # Recommended: 0.68 (only trade when Synth says >68% or <32%).
     min_synth_conviction: float = field(default_factory=lambda: _env_float("MIN_SYNTH_CONVICTION", 0.68))
     backtest_thresholds: tuple = (0.03, 0.05, 0.07, 0.10, 0.15, 0.20)
-    # Per-asset edge overrides: thinner books (HYPE, SOL) require wider net edge.
+    # Per-asset edge overrides: can require wider net edge for thinner books.
+    # Empty by default since we only trade BTC and ETH (liquid markets).
+    # Set THIN_MARKET_ASSETS=HYPE,SOL if those assets are re-enabled.
     thin_market_assets: List[str] = field(default_factory=lambda: [
-        a.strip().upper() for a in (_env("THIN_MARKET_ASSETS", "HYPE,SOL") or "").split(",") if a.strip()
+        a.strip().upper() for a in (_env("THIN_MARKET_ASSETS", "") or "").split(",") if a.strip()
     ])
     thin_market_min_edge: float = field(default_factory=lambda: _env_float("THIN_MARKET_MIN_EDGE", 0.08))
 
@@ -136,8 +138,11 @@ class Config:
     ])
 
     # --- Synth assets to trade ---
+    # BTC + ETH only: 4 API calls/scan (2 assets × 2 horizons).
+    # At 10-min interval this costs ~17k tokens/month against a 20k budget.
+    # Adding SOL/HYPE doubles to 8 calls/scan, requiring a 17-min interval for the same budget.
     synth_assets: List[str] = field(default_factory=lambda: [
-        a.strip().upper() for a in (_env("SYNTH_ASSETS", "BTC,ETH,SOL,HYPE") or "").split(",") if a.strip()
+        a.strip().upper() for a in (_env("SYNTH_ASSETS", "BTC,ETH") or "").split(",") if a.strip()
     ])
     # Horizons (seconds). Supported insight endpoints: 900=15M, 3600=1H.
     synth_horizons_sec: List[int] = field(default_factory=lambda: [
