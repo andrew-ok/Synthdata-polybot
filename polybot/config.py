@@ -184,6 +184,16 @@ class Config:
     segment_disable_min_samples: int = field(default_factory=lambda: int(_env("SEGMENT_DISABLE_MIN_SAMPLES", "50") or "50"))
     segment_disable_sharpe_below: float = field(default_factory=lambda: _env_float("SEGMENT_DISABLE_SHARPE_BELOW", 0.0))
 
+    # --- Late-window entry gates (Synth post strategy) ---
+    # Only enter contracts with FEWER than this many seconds remaining.
+    # Set to inf (default) to allow entry at any time.
+    # Late-window profile: 1200s = 20 min remaining on 1H contracts.
+    max_seconds_to_event_end: float = field(default_factory=lambda: _env_float("MAX_SECONDS_TO_EVENT_END", float("inf")))
+    # Only buy contracts already priced above this threshold by the market.
+    # Captures the risk-premium effect: participants discount high-prob near-expiry contracts.
+    # 0.0 = disabled (default). Late-window profile: 0.75.
+    min_entry_price: float = field(default_factory=lambda: _env_float("MIN_ENTRY_PRICE", 0.0))
+
     # --- Exit rules ---
     # Strategy B: only TIME_STOP (30s before resolution) and MODEL_REVERSAL fire.
     # SYNTH_EV_COLLAPSE is handled in evaluate_synth_updates().
@@ -259,9 +269,30 @@ LIVE_SAFE_PROFILE: Dict[str, Any] = {
     "max_clob_staleness_sec": 15.0,
 }
 
+LATE_WINDOW_PROFILE: Dict[str, Any] = {
+    # Replicates the Synth post strategy:
+    # Enter 1H contracts with <20 min remaining where market is already 75¢+
+    # and Synth says ≥10% higher. Convergence is nearly guaranteed in 20 min.
+    "min_entry_edge": 0.08,            # ~10% raw edge minus ~2% fees
+    "min_synth_conviction": 0.82,      # Synth must be highly confident
+    "min_entry_price": 0.75,           # only buy contracts market already prices at 75¢+
+    "max_seconds_to_event_end": 1200.0,  # enter only in the last 20 minutes
+    "min_seconds_to_enter": 120.0,     # but at least 2 min to close
+    "time_stop_seconds": 60.0,
+    "synth_horizons_sec": [3600],      # hourly contracts only (the post's exact market)
+    "max_entry_age_1h_sec": 3300.0,    # Synth data freshness unchanged
+    "min_confidence_score": 0.60,      # relaxed — fewer calibration samples in this window
+    "execution_mode": "taker",         # guaranteed fill in the short remaining window
+    "one_position_per_market": True,
+    "allow_reentry_after_exit": False,
+    "model_confidence_floor": 0.60,
+    "calibration_shrinkage_k": 50.0,
+}
+
 _PROFILES: Dict[str, Dict[str, Any]] = {
     "paper": PAPER_PROFILE,
     "live_safe": LIVE_SAFE_PROFILE,
+    "late_window": LATE_WINDOW_PROFILE,
 }
 
 

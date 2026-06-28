@@ -199,6 +199,23 @@ class RiskManager:
         min_secs = CONFIG.min_seconds_to_enter
         if sig.seconds_to_event_end is not None and sig.seconds_to_event_end < min_secs:
             return False, f"only {sig.seconds_to_event_end:.0f}s to close < min_seconds_to_enter {min_secs:.0f}s"
+        # Late-window gate: only enter when fewer than max_seconds_to_event_end remain.
+        if (
+            CONFIG.max_seconds_to_event_end != float("inf")
+            and sig.seconds_to_event_end is not None
+            and sig.seconds_to_event_end > CONFIG.max_seconds_to_event_end
+        ):
+            return False, (
+                f"{sig.seconds_to_event_end:.0f}s remaining > late-window max "
+                f"{CONFIG.max_seconds_to_event_end:.0f}s (not yet in entry window)"
+            )
+        # High-price gate: only buy contracts the market already prices above threshold.
+        # Captures the convergence + risk-premium edge on near-expiry contracts.
+        if CONFIG.min_entry_price > 0 and sig.execution_price < CONFIG.min_entry_price:
+            return False, (
+                f"entry price {sig.execution_price:.3f} < min_entry_price "
+                f"{CONFIG.min_entry_price:.3f} (contract not yet heavily priced)"
+            )
         if (
             CONFIG.min_hours_to_resolution > 0
             and sig.hours_to_resolution is not None
