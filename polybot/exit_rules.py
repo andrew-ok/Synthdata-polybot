@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
 from .config import CONFIG
+from .order_log import log_order_event
+from .order_manager import cancel_order, create_exit_order, get_order_by_id, get_pending_orders
 from .position_manager import Position, close_position, open_positions, update_position
-from .signal_engine import Signal
+from .signal_engine import Signal, taker_fee
+from .trade_log import log_exit
+
+from datetime import timedelta
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,9 +35,14 @@ class ExitDecision:
     realized_pnl: float
 
 
-def _exit_fill_price(bid: float) -> float:
+def _exit_cost(bid: float = 0.5) -> float:
+    """Exit cost: taker fee at exit price plus slippage."""
     slip = CONFIG.assumed_slippage_bps / 10_000.0
-    return max(0.001, bid - slip)
+    return taker_fee(bid) + slip
+
+
+def _exit_fill_price(bid: float) -> float:
+    return max(0.001, bid - _exit_cost(bid))
 
 
 def _append_exit(decision: ExitDecision) -> None:
@@ -52,7 +65,7 @@ def _append_fill(position: Position, decision: ExitDecision) -> None:
         "intended_price": decision.exit_bid,
         "fill_price": decision.exit_fill_price,
         "estimated_slippage": decision.exit_bid - decision.exit_fill_price,
-        "estimated_fee": (decision.exit_fill_price * position.contracts) * (CONFIG.taker_fee_bps / 10_000.0),
+        "estimated_fee": round(position.contracts * taker_fee(decision.exit_bid), 6),
         "contracts": position.contracts,
         "notional_usd": decision.exit_fill_price * position.contracts,
         "fair_probability": decision.fair_probability,
@@ -67,22 +80,42 @@ def _append_fill(position: Position, decision: ExitDecision) -> None:
 
 
 def _exit_reason(position: Position, same_side: Optional[Signal], opposite: Optional[Signal]) -> Optional[str]:
+    """Return an exit reason for an already-open position, or None to hold.
+
+    Strategy B: hold-to-resolution conviction betting. Positions ride to the
+    window close unless Synth itself reverses. Market repricing toward Synth's
+    probability is confirmation Synth was right — not a reason to exit early.
+
+    Exit triggers (in priority order):
+    1. STALE_DATA    — no CLOB data at all; can't manage the position.
+    2. TIME_STOP     — near-resolution simulation: at < time_stop_seconds (30s),
+                       the market price is a reliable proxy for the resolution
+                       payout. Exit here to book PnL in paper mode.
+    3. MODEL_REVERSAL — Synth now predicts the opposite side with genuine positive
+                        net edge that exceeds our side's edge. Only fires when
+                        opposite.net_edge > 0 (prevents spurious exits when both
+                        sides are below threshold).
+
+    SYNTH_EV_COLLAPSE is handled separately by evaluate_synth_updates(), which
+    fires an emergency taker exit when Synth's updated probability drops below
+    the position's avg entry price (EV goes negative).
+    """
     if same_side is None:
         return "STALE_DATA"
-    hold_edge = same_side.fair_probability - same_side.exit_price - _exit_cost()
-    if hold_edge < CONFIG.min_exit_edge:
-        return "EDGE_COLLAPSE"
-    if opposite is not None and opposite.net_edge > same_side.net_edge:
-        return "MODEL_REVERSAL"
-    if same_side.score < CONFIG.min_confidence_score * CONFIG.min_entry_edge:
-        return "RANK_DECAY"
-    if same_side.seconds_to_event_end is not None and same_side.seconds_to_event_end < CONFIG.time_stop_seconds:
+
+    # TIME_STOP: paper-trading resolution simulation. At 30s to close the bid
+    # is a reliable proxy for the binary payout — exit to book PnL.
+    secs = same_side.seconds_to_event_end
+    if secs is not None and secs < CONFIG.time_stop_seconds:
         return "TIME_STOP"
+
+    # Model reversal: Synth now predicts the opposite side with genuine positive
+    # net edge. Require opposite.net_edge > 0 so we never exit when both sides
+    # are below the entry threshold (market repricing ≠ Synth reversal).
+    if opposite is not None and opposite.net_edge > 0 and opposite.net_edge > same_side.net_edge:
+        return "MODEL_REVERSAL"
+
     return None
-
-
-def _exit_cost() -> float:
-    return (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0
 
 
 def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
@@ -119,11 +152,247 @@ def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
             fair_probability=fair,
             exit_bid=bid,
             exit_fill_price=fill_px,
-            hold_edge=fair - bid - _exit_cost(),
+            hold_edge=fair - bid - _exit_cost(bid),
             score=score,
             realized_pnl=closed.realized_pnl or 0.0,
         )
         _append_exit(decision)
         _append_fill(position, decision)
+        log_exit(position=position, decision=decision, signal=same_side)
         decisions.append(decision)
     return decisions
+
+
+# ---------------------------------------------------------------------------
+# Scale-in strategy: Synth-update handler
+# ---------------------------------------------------------------------------
+
+def on_synth_update(position: Position, new_synth_p: float) -> str:
+    """
+    Called whenever Synth refreshes its probability for a position's asset.
+    Updates the position's target and returns an action string:
+      "hold"          — still +EV, do nothing
+      "update_target" — still +EV but target price changed; update exit limit order
+      "exit"          — no longer +EV; trigger emergency taker exit
+
+    Handles both YES/NO (scale-in convention) and UP/DOWN (signal engine convention).
+    YES and UP are equivalent (buying the up-leg token); NO and DOWN are equivalent.
+    """
+    position.synth_p_current = new_synth_p
+    position.target_exit_price = new_synth_p
+
+    if position.side in ("YES", "UP"):
+        ev = new_synth_p - position.avg_entry_price
+    else:  # NO or DOWN: fair value for the down leg is 1 - synth_p_up
+        ev = (1 - new_synth_p) - position.avg_entry_price
+
+    position.is_ev_positive = ev > CONFIG.min_ev_to_hold
+
+    if not position.is_ev_positive:
+        position.emergency_exit = True
+        return "exit"
+
+    # Only replace the resting exit order when target moves by more than 1¢ to avoid churn.
+    if abs(position.target_exit_price - position.layers[-1].get("exit_order_price", 0)) > 0.01:
+        return "update_target"
+
+    return "hold"
+
+
+def place_exit_order(position: Position) -> str:
+    """
+    Cancels any existing exit order for this position, then places a new
+    post-only limit order to sell the full filled position at target_exit_price.
+    Returns the new order_id.
+
+    Total shares to sell = sum of shares across all filled layers.
+    Accepts both YES/NO (scale-in convention) and UP/DOWN (signal-engine convention).
+    Price: position.target_exit_price
+    """
+    if position.side not in ("YES", "NO", "UP", "DOWN"):
+        raise ValueError(
+            f"place_exit_order expects a YES/NO/UP/DOWN position, got side={position.side!r}"
+        )
+    if position.target_exit_price <= 0.0:
+        raise ValueError(
+            f"place_exit_order: invalid target_exit_price={position.target_exit_price} "
+            f"for position {position.position_id}"
+        )
+
+    # Always cancel the old exit order before placing a new one to avoid duplicate fills.
+    if position.exit_order_id:
+        old = get_order_by_id(position.exit_order_id)
+        if old is not None and old.status == "PENDING":
+            done = cancel_order(old, "EXIT_ORDER_REPLACED")
+            log_order_event("ORDER_CANCELLED", done, reason="EXIT_ORDER_REPLACED")
+
+    total_shares = sum(
+        float(layer.get("shares", 0))
+        for layer in position.layers
+        if layer.get("filled", False)
+    )
+    if total_shares <= 0:
+        raise ValueError(
+            f"place_exit_order: no filled shares for position {position.position_id}"
+        )
+
+    # GTD expiry: market resolution time minus 30 seconds.
+    expires_at: Optional[str] = None
+    if position.market_end_time:
+        try:
+            end_dt = datetime.fromisoformat(position.market_end_time)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            expires_at = (end_dt - timedelta(seconds=30)).isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    order = create_exit_order(
+        position=position,
+        shares=total_shares,
+        limit_price=position.target_exit_price,
+        expires_at=expires_at,
+    )
+
+    # Persist the new exit order_id back onto the position.
+    update_position(position.position_id, exit_order_id=order.order_id)
+
+    log.info(
+        "Exit order PLACED: %s %s/%s/%s shares=%.4f limit=%.4f expiry=%s",
+        order.order_id[:8], position.asset, position.side,
+        position.event_key[:8], total_shares, position.target_exit_price, expires_at,
+    )
+    return order.order_id
+
+
+def _cancel_position_orders(position: Position) -> int:
+    """Cancel all PENDING entry orders associated with this position's condition_id."""
+    cancelled = 0
+    for order in get_pending_orders():
+        if order.condition_id == position.condition_id:
+            done = cancel_order(order, "SYNTH_EV_EXIT")
+            log_order_event("ORDER_CANCELLED", done, reason="SYNTH_EV_EXIT")
+            cancelled += 1
+    return cancelled
+
+
+def evaluate_synth_updates(signals: Iterable[Signal]) -> List[ExitDecision]:
+    """
+    Called every scan after fresh Synth data is fetched.
+    Runs on_synth_update for each open scale-in position (side == "YES"/"NO")
+    and applies the resulting action:
+      - "exit":          cancel any pending entry orders; execute an immediate
+                         taker (FAK) close at current bid minus fees.
+      - "update_target": cancel the resting exit limit order and replace it with
+                         a new post-only limit at target_exit_price.  In paper
+                         mode this is persisted as a position-field update; the
+                         next scan's evaluate_and_apply_exits will honour it.
+      - "hold":          persist updated Synth probability; no order changes.
+
+    Legacy UP/DOWN positions are handled by evaluate_and_apply_exits instead.
+    """
+    signal_map: Dict[tuple[str, str], Signal] = {(s.event_key, s.side): s for s in signals}
+    exits: List[ExitDecision] = []
+
+    for position in open_positions():
+        # Positions must have at least one layer (always true for fills created by this bot).
+        if not position.layers:
+            continue
+        # Both YES/NO (scale-in) and UP/DOWN (signal-engine) conventions are handled.
+        # YES and UP are equivalent (up-leg token); NO and DOWN are equivalent.
+        if position.side in ("YES", "UP"):
+            signal_side = "UP"
+        elif position.side in ("NO", "DOWN"):
+            signal_side = "DOWN"
+        else:
+            continue
+        sig = signal_map.get((position.event_key, signal_side))
+        if sig is None:
+            continue
+
+        action = on_synth_update(position, sig.raw_synth_probability)
+        current_bid = sig.exit_price
+
+        if action == "exit":
+            n_cancelled = _cancel_position_orders(position)
+            if n_cancelled:
+                log.info(
+                    "Cancelled %d pending order(s) for %s before emergency exit",
+                    n_cancelled, position.position_id[:8],
+                )
+            fill_px = _exit_fill_price(current_bid)
+            closed = close_position(position, fill_px, "SYNTH_EV_COLLAPSE")
+            decision = ExitDecision(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                position_id=position.position_id,
+                event_key=position.event_key,
+                side=position.side,
+                reason="SYNTH_EV_COLLAPSE",
+                fair_probability=position.synth_p_current,
+                exit_bid=current_bid,
+                exit_fill_price=fill_px,
+                hold_edge=position.synth_p_current - current_bid - _exit_cost(current_bid),
+                score=position.latest_score,
+                realized_pnl=closed.realized_pnl or 0.0,
+            )
+            _append_exit(decision)
+            _append_fill(position, decision)
+            log_exit(position=position, decision=decision, signal=sig)
+            exits.append(decision)
+            log.info(
+                "Emergency taker exit: %s %s/%s fill=%.4f pnl=%.4f",
+                position.position_id[:8], position.asset, position.side,
+                fill_px, decision.realized_pnl,
+            )
+
+        elif action == "update_target":
+            # Stamp updated exit_order_price on the last layer so on_synth_update's
+            # 1¢ churn guard sees the price we actually posted.
+            updated_layers = list(position.layers)
+            updated_layers[-1] = {
+                **updated_layers[-1],
+                "exit_order_price": position.target_exit_price,
+            }
+            # Refresh market_end_time from the current signal before (re-)placing.
+            if sig.seconds_to_event_end is not None:
+                position.market_end_time = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=float(sig.seconds_to_event_end))
+                ).isoformat()
+            update_position(
+                position.position_id,
+                synth_p_current=position.synth_p_current,
+                target_exit_price=position.target_exit_price,
+                is_ev_positive=position.is_ev_positive,
+                layers=updated_layers,
+                market_end_time=position.market_end_time,
+            )
+            try:
+                place_exit_order(position)
+            except Exception as exc:
+                log.warning(
+                    "place_exit_order failed for %s: %s",
+                    position.position_id[:8], exc,
+                )
+            log.debug(
+                "update_target: %s %s/%s new_exit_limit=%.4f",
+                position.position_id[:8], position.asset, position.side,
+                position.target_exit_price,
+            )
+
+        else:  # "hold" — persist the refreshed Synth probability only
+            market_end_time = position.market_end_time
+            if sig.seconds_to_event_end is not None:
+                market_end_time = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=float(sig.seconds_to_event_end))
+                ).isoformat()
+            update_position(
+                position.position_id,
+                synth_p_current=position.synth_p_current,
+                target_exit_price=position.target_exit_price,
+                is_ev_positive=position.is_ev_positive,
+                market_end_time=market_end_time,
+            )
+
+    return exits

@@ -21,13 +21,17 @@ not available, it is still the conservative fallback.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 from .calibration import Calibrator, CalibrationResult
 from .config import CONFIG
 from .event_identity import event_key_for_opportunity
+
 from .synth_client import Opportunity
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,12 +75,23 @@ class Signal:
     reason: str = "insights"
     clob_source: str = "real_clob"
     is_stale: bool = False
+    execution_mode: str = "taker"  # "maker" or "taker"
 
 
-def _net(raw: float) -> float:
-    fee = CONFIG.taker_fee_bps / 10_000.0
+def taker_fee(price: float) -> float:
+    """Crypto taker fee fraction at execution price (peaks at 1.80% at 50¢)."""
+    return CONFIG.crypto_taker_fee_rate * price * (1.0 - price)
+
+
+def _entry_cost(price: float, is_maker: bool = False) -> float:
     slip = CONFIG.assumed_slippage_bps / 10_000.0
-    return raw - fee - slip
+    if is_maker:
+        return slip  # zero taker fee; rebate paid separately by Polymarket
+    return taker_fee(price) + slip
+
+
+def _net(raw: float, price: float = 0.5, is_maker: bool = False) -> float:
+    return raw - _entry_cost(price, is_maker=is_maker)
 
 
 def _spread(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
@@ -91,8 +106,11 @@ def _liquidity_score(liquidity: float) -> float:
     return max(0.0, min(1.0, liquidity / (CONFIG.min_liquidity * 5.0)))
 
 
-def _entry_cost() -> float:
-    return (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0
+def _effective_threshold(asset: str, threshold: float) -> float:
+    """Return per-asset minimum edge, enforcing a wider bar for thin-book markets."""
+    if asset.upper() in CONFIG.thin_market_assets:
+        return max(threshold, CONFIG.thin_market_min_edge)
+    return threshold
 
 
 def _question_from(opp: Opportunity) -> str:
@@ -119,6 +137,7 @@ def _signal(
     threshold: float,
     reason: str,
     clob_source: str,
+    is_maker: bool = False,
 ) -> Optional[Signal]:
     if not (0 < ask < 1):
         return None
@@ -126,7 +145,7 @@ def _signal(
         return None
     if spread is not None and spread > CONFIG.max_spread:
         return None
-    entry_cost = _entry_cost()
+    entry_cost = _entry_cost(ask, is_maker=is_maker)
     net_ev = calibration.fair_probability - ask - entry_cost
     if net_ev < threshold:
         return None
@@ -173,7 +192,39 @@ def _signal(
         reason=reason,
         clob_source=clob_source,
         is_stale=_is_stale(opp),
+        execution_mode="maker" if is_maker else "taker",
     )
+
+
+def _apply_fill_model(
+    sig: Signal,
+    fill_model: str,
+    best_ask: Optional[float],
+    maker_px: float,
+) -> Optional[Signal]:
+    """Return sig if the fill model allows a fill; None to discard the signal."""
+    if fill_model == "optimistic":
+        return sig
+    if fill_model == "no_maker_fill":
+        return None
+    if fill_model == "touch":
+        # Fill only if the current best ask is already at or below our limit
+        # price — i.e., the market has traded through our order on this snapshot.
+        if best_ask is None or best_ask > maker_px:
+            return None
+        return sig
+    if fill_model == "next_tick":
+        log.warning(
+            "maker_fill_model=next_tick requires multi-tick data; "
+            "falling back to optimistic fill assumption"
+        )
+        return sig
+    if fill_model == "order_lifecycle":
+        # Signal passes through; actual fill is deferred to order_lifecycle.py
+        return sig
+    log.warning("Unknown maker_fill_model=%r; defaulting to optimistic", fill_model)
+    return sig
+
 
 
 def evaluate(
@@ -181,8 +232,11 @@ def evaluate(
     threshold: Optional[float] = None,
     calibrator: Optional[Calibrator] = None,
 ) -> List[Signal]:
-    thr = CONFIG.min_entry_edge if threshold is None else threshold
+    base_thr = CONFIG.min_entry_edge if threshold is None else threshold
     calibrator = calibrator or Calibrator()
+    is_maker = CONFIG.execution_mode == "maker"
+    maker_offset = CONFIG.maker_entry_offset  # already in decimal price units (0.001 = 0.1¢)
+    fill_model = CONFIG.maker_fill_model if is_maker else "optimistic"
     signals: List[Signal] = []
 
     for opp in opportunities:
@@ -190,6 +244,8 @@ def evaluate(
             continue
         if not event_key_for_opportunity(opp):
             continue
+        thr = _effective_threshold(opp.asset, base_thr)
+
         yes_ask_check = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
         if yes_ask_check is not None and opp.no_ask_price is not None:
             ask_sum = yes_ask_check + opp.no_ask_price
@@ -201,9 +257,22 @@ def evaluate(
         yes_ask = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
         yes_spread = _spread(yes_bid, yes_ask)
         yes_liq = (opp.yes_ask_size or opp.best_ask_size) * (yes_ask or 0.0)
-        if yes_ask is not None and yes_bid is not None:
+        if yes_bid is not None and (yes_ask is not None or is_maker):
             cal = calibrator.calibrate_side(opp.asset, opp.horizon, "UP", opp.synth_probability_up)
-            sig = _signal(opp, "UP", yes_ask, yes_bid, yes_spread, yes_liq, opp.synth_probability_up, cal, thr, "real_yes_clob", "real_clob")
+            if is_maker and yes_bid is not None:
+                # Post limit order just above best bid; cap below ask to remain non-crossing.
+                maker_px = yes_bid + maker_offset
+                if yes_ask is not None:
+                    maker_px = min(maker_px, yes_ask - 0.001)
+                maker_px = round(min(0.999, max(0.001, maker_px)), 4)
+                sig = _signal(opp, "UP", maker_px, yes_bid, yes_spread, yes_liq,
+                              opp.synth_probability_up, cal, thr, "maker_yes_clob", "real_clob",
+                              is_maker=True)
+                if sig:
+                    sig = _apply_fill_model(sig, fill_model, yes_ask, maker_px)
+            else:
+                sig = _signal(opp, "UP", yes_ask, yes_bid, yes_spread, yes_liq,
+                              opp.synth_probability_up, cal, thr, "real_yes_clob", "real_clob")
             if sig:
                 signals.append(sig)
         elif CONFIG.require_real_two_sided_clob:
@@ -215,23 +284,39 @@ def evaluate(
             bid_down = opp.no_bid_price or 0.0
             spread_down = _spread(opp.no_bid_price, opp.no_ask_price)
             liquidity_down = opp.no_ask_size * ask_down
-            reason = "real_down_clob"
-            clob_source = "real_clob"
+            reason_down = "real_down_clob"
+            clob_source_down = "real_clob"
         elif CONFIG.allow_complementary_book_fallback and opp.best_bid_price is not None:
             implied_down_ask = max(0.0, min(1.0, 1.0 - opp.best_bid_price))
             ask_down = implied_down_ask
             bid_down = max(0.0, 1.0 - (opp.best_ask_price or 1.0))
             spread_down = _spread(opp.best_bid_price, opp.best_ask_price)
             liquidity_down = opp.best_bid_size * opp.best_bid_price
-            reason = "complementary_book"
-            clob_source = "complementary_book"
+            reason_down = "complementary_book"
+            clob_source_down = "complementary_book"
         else:
             ask_down = None
+            bid_down = 0.0
+            spread_down = None
+            liquidity_down = 0.0
+            reason_down = ""
+            clob_source_down = ""
 
         if ask_down is not None:
             synth_down = opp.synth_probability_down
             cal = calibrator.calibrate_side(opp.asset, opp.horizon, "DOWN", synth_down)
-            sig = _signal(opp, "DOWN", ask_down, bid_down, spread_down, liquidity_down, synth_down, cal, thr, reason, clob_source)
+            if is_maker and bid_down > 0:
+                maker_px_down = bid_down + maker_offset
+                maker_px_down = min(maker_px_down, ask_down - 0.001)
+                maker_px_down = round(min(0.999, max(0.001, maker_px_down)), 4)
+                sig = _signal(opp, "DOWN", maker_px_down, bid_down, spread_down, liquidity_down,
+                              synth_down, cal, thr, "maker_down_clob", clob_source_down,
+                              is_maker=True)
+                if sig:
+                    sig = _apply_fill_model(sig, fill_model, opp.no_ask_price, maker_px_down)
+            else:
+                sig = _signal(opp, "DOWN", ask_down, bid_down, spread_down, liquidity_down,
+                              synth_down, cal, thr, reason_down, clob_source_down)
             if sig:
                 signals.append(sig)
 

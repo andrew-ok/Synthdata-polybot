@@ -11,8 +11,8 @@ Historical API backtest (run_backtest):
 Snapshot replay (run_snapshot_backtest):
     Replays the local snapshots.sqlite3 database that accumulates during live
     scanner runs. Each stored timestamp is treated as an atomic scan with full
-    Strategy B rules: exits evaluated first (STALE_DATA, EDGE_COLLAPSE,
-    MODEL_REVERSAL, TIME_STOP, RESOLVED), then candidates scored and ranked,
+    Strategy B rules: exits evaluated first (STALE_DATA, MODEL_REVERSAL,
+    TIME_STOP, RESOLVED), then candidates scored and ranked,
     then max_trades_per_scan + full exposure limits enforced before opening.
     Requires accumulated live snapshots. This is the authoritative Strategy B
     backtest.
@@ -32,7 +32,7 @@ from .config import CONFIG
 from .calibration import CalibrationObservation, Calibrator, append_observation
 from .gamma_resolver import resolve_final_outcome_from_gamma
 from .polymarket_client import PolymarketClient
-from .signal_engine import evaluate
+from .signal_engine import evaluate, taker_fee
 from .synth_client import INSIGHTS_PATHS, SynthInsightsClient, configured_horizons
 
 log = logging.getLogger(__name__)
@@ -147,9 +147,9 @@ def estimate_call_count(
 
 def _process_signal(stats: _Stats, sig, resolved_up: bool, holding_period_sec: float) -> None:
     """Apply a signal as if traded; charge fees+slippage; record outcome."""
-    fee = CONFIG.taker_fee_bps / 10_000.0
     slip = CONFIG.assumed_slippage_bps / 10_000.0
-    fill_px = min(0.999, sig.execution_price + slip)
+    is_maker = sig.execution_mode == "maker"
+    fill_px = min(0.999, sig.execution_price + (0 if is_maker else slip))
     if fill_px <= 0 or fill_px >= 1:
         return
 
@@ -160,6 +160,8 @@ def _process_signal(stats: _Stats, sig, resolved_up: bool, holding_period_sec: f
     contracts = notional / fill_px
     won = (sig.side == "UP" and resolved_up) or (sig.side == "DOWN" and not resolved_up)
     payoff = contracts * 1.0 if won else 0.0
+    # Maker: zero taker fee. Taker: dynamic price-dependent crypto fee.
+    fee = 0.0 if is_maker else taker_fee(fill_px)
     pnl = payoff - notional - (notional * fee)
 
     prob = sig.calibrated_probability
@@ -372,7 +374,7 @@ def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, o
 
     calibrator = Calibrator()
     open_by_event: Dict[str, _ReplayPosition] = {}
-    entry_cost = (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0
+    slip = CONFIG.assumed_slippage_bps / 10_000.0
     position_size = CONFIG.bankroll_usd * CONFIG.max_position_size
 
     with sqlite3.connect(path) as conn:
@@ -414,13 +416,12 @@ def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, o
             cal = calibrator.calibrate_side(
                 same_row["asset"], same_row["horizon"], pos.side, same_row["raw_synth_probability"]
             )
-            hold_edge = cal.fair_probability - bid - entry_cost
 
+            # Strategy B exits: hold to resolution unless Synth reverses.
+            # No EDGE_COLLAPSE — market repricing toward Synth confirms the bet.
             exit_reason = None
             if is_stale:
                 exit_reason = "STALE_DATA"
-            elif hold_edge < CONFIG.min_exit_edge:
-                exit_reason = "EDGE_COLLAPSE"
             elif (
                 same_row["seconds_to_event_end"] is not None
                 and same_row["seconds_to_event_end"] < CONFIG.time_stop_seconds
@@ -433,17 +434,24 @@ def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, o
                 and not bool(opp_row["is_stale"])
                 and opp_row["best_ask"] is not None
             ):
-                # MODEL_REVERSAL: opposite side now has stronger positive net edge.
+                # MODEL_REVERSAL: opposite side has genuine positive net edge
+                # that exceeds our side's edge. Require opp_net_edge > 0 so we
+                # don't exit when both sides are below threshold.
+                # Use price-dependent taker fee to mirror the live scanner.
                 opp_cal = calibrator.calibrate_side(
                     opp_row["asset"], opp_row["horizon"], opp_side, opp_row["raw_synth_probability"]
                 )
-                opp_net_edge = opp_cal.fair_probability - float(opp_row["best_ask"]) - entry_cost
+                opp_ask_f = float(opp_row["best_ask"])
+                opp_fee = CONFIG.crypto_taker_fee_rate * opp_ask_f * (1.0 - opp_ask_f) + slip
+                opp_net_edge = opp_cal.fair_probability - opp_ask_f - opp_fee
                 same_ask = same_row["best_ask"]
-                same_net_edge = (
-                    cal.fair_probability - float(same_ask) - entry_cost
-                    if same_ask is not None else -1.0
-                )
-                if opp_net_edge > same_net_edge:
+                if same_ask is not None:
+                    same_ask_f = float(same_ask)
+                    same_fee = CONFIG.crypto_taker_fee_rate * same_ask_f * (1.0 - same_ask_f) + slip
+                    same_net_edge = cal.fair_probability - same_ask_f - same_fee
+                else:
+                    same_net_edge = -1.0
+                if opp_net_edge > 0 and opp_net_edge > same_net_edge:
                     exit_reason = "MODEL_REVERSAL"
 
             if exit_reason:
@@ -488,9 +496,27 @@ def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, o
                 continue
             if liquidity < CONFIG.min_liquidity:
                 continue
-            cal = calibrator.calibrate_side(row["asset"], row["horizon"], side, row["raw_synth_probability"])
-            net_ev = cal.fair_probability - float(ask) - entry_cost
-            if net_ev < CONFIG.min_entry_edge or cal.confidence_score < CONFIG.min_confidence_score:
+            # Entry age gate — mirror live scanner: only enter near window open.
+            event_age = row["event_age_sec"]
+            horizon = row["horizon"]
+            max_age = CONFIG.max_entry_age_15m_sec if horizon == "15M" else CONFIG.max_entry_age_1h_sec
+            if event_age is not None and float(event_age) > max_age:
+                continue
+            secs_end = row["seconds_to_event_end"]
+            if secs_end is not None and float(secs_end) < CONFIG.min_seconds_to_enter:
+                continue
+            # Synth conviction gate — mirror live scanner: only trade decisive signals.
+            raw_p = float(row["raw_synth_probability"])
+            if CONFIG.min_synth_conviction > 0 and abs(raw_p - 0.5) < (CONFIG.min_synth_conviction - 0.5):
+                continue
+            cal = calibrator.calibrate_side(row["asset"], row["horizon"], side, raw_p)
+            if cal.confidence_score < CONFIG.min_confidence_score:
+                continue
+            # Price-dependent taker fee to match live scanner cost model exactly.
+            ask_f = float(ask)
+            entry_cost = CONFIG.crypto_taker_fee_rate * ask_f * (1.0 - ask_f) + slip
+            net_ev = cal.fair_probability - ask_f - entry_cost
+            if net_ev < CONFIG.min_entry_edge:
                 continue
             score = net_ev * cal.confidence_score
             candidates.append((score, net_ev, cal, row))

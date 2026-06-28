@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set
 
 from .config import CONFIG
-from .position_manager import exposure_summary, has_open_event, recently_closed_or_opened, open_positions
+from .position_manager import exposure_summary, has_open_event, recently_closed_or_opened, open_positions, has_traded_market
 from .signal_engine import Signal
 
 log = logging.getLogger(__name__)
@@ -82,9 +82,21 @@ class RiskManager:
 
             event_key = sig.event_key
             condition_id = (sig.condition_id or sig.event_key or sig.slug or "").strip()
-            if event_key and has_open_event(event_key):
-                decisions.append(Decision(sig, False, "open position already exists for this event_key"))
+            if event_key and CONFIG.one_position_per_market and has_open_event(event_key):
+                decisions.append(Decision(sig, False, "one_position_per_market: open position on this market"))
                 continue
+            # Block if a pending order already exists for this event/condition
+            # (order_lifecycle mode — avoid stacking orders on the same market)
+            if CONFIG.maker_fill_model == "order_lifecycle":
+                from .order_manager import has_pending_order_for_event
+                if event_key and has_pending_order_for_event(event_key):
+                    decisions.append(Decision(sig, False, "pending order exists for this event_key"))
+                    continue
+            if not CONFIG.allow_reentry_after_exit:
+                cid = (sig.condition_id or "").strip()
+                if cid and has_traded_market(cid):
+                    decisions.append(Decision(sig, False, "allow_reentry_after_exit=False: market previously traded"))
+                    continue
             if event_key and recently_closed_or_opened(event_key):
                 decisions.append(Decision(sig, False, "event_key in position cooldown"))
                 continue
@@ -164,6 +176,12 @@ class RiskManager:
             return False, f"net entry edge {sig.net_edge:.3f} < {CONFIG.min_entry_edge:.3f}"
         if sig.confidence_score < CONFIG.min_confidence_score:
             return False, f"confidence {sig.confidence_score:.3f} < {CONFIG.min_confidence_score:.3f}"
+        # Synth conviction filter: only trade when Synth is decisively away from 50%.
+        # A 65% signal has half the information content of a 75% signal.
+        if CONFIG.min_synth_conviction > 0:
+            distance_from_50 = abs(sig.raw_synth_probability - 0.5)
+            if distance_from_50 < (CONFIG.min_synth_conviction - 0.5):
+                return False, f"synth prob {sig.raw_synth_probability:.3f} not far enough from 0.5 (min conviction {CONFIG.min_synth_conviction:.2f})"
         # Rule 4: spread <= 5pp.
         if sig.spread is not None and sig.spread > CONFIG.max_spread:
             return False, f"spread {sig.spread:.3f} > max_spread {CONFIG.max_spread:.3f}"
@@ -178,11 +196,9 @@ class RiskManager:
         max_age = CONFIG.max_entry_age_15m_sec if sig.horizon == "15M" else CONFIG.max_entry_age_1h_sec
         if sig.event_age_sec is not None and sig.event_age_sec > max_age:
             return False, f"event age {sig.event_age_sec:.0f}s > max entry age {max_age:.0f}s"
-        if sig.seconds_to_event_end is not None and sig.seconds_to_event_end < CONFIG.min_seconds_to_event_end:
-            return False, (
-                f"only {sig.seconds_to_event_end:.0f}s to close "
-                f"< min {CONFIG.min_seconds_to_event_end:.0f}s"
-            )
+        min_secs = CONFIG.min_seconds_to_enter
+        if sig.seconds_to_event_end is not None and sig.seconds_to_event_end < min_secs:
+            return False, f"only {sig.seconds_to_event_end:.0f}s to close < min_seconds_to_enter {min_secs:.0f}s"
         if (
             CONFIG.min_hours_to_resolution > 0
             and sig.hours_to_resolution is not None
@@ -204,6 +220,9 @@ class RiskManager:
         confidence_multiplier = min(CONFIG.max_confidence_position_multiplier, max(CONFIG.model_confidence_floor, sig.model_confidence))
         frac = min(CONFIG.max_position_size, frac * confidence_multiplier)
         size_usd = round(self.bankroll * frac, 2)
+        # In paper mode, cap at paper_position_size_usd for data collection
+        if CONFIG.paper_trade_mode and CONFIG.paper_position_size_usd > 0:
+            size_usd = min(size_usd, CONFIG.paper_position_size_usd)
         contracts = round(size_usd / sig.execution_price, 4) if sig.execution_price > 0 else 0.0
         return size_usd, contracts
 

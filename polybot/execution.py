@@ -19,6 +19,9 @@ from .config import CONFIG
 from .position_manager import has_open_event, open_position_from_fill
 from .risk_manager import Decision
 from .reports import write_daily_report
+from .signal_engine import taker_fee
+from .order_manager import PendingOrder, create_order, has_pending_order_for_event
+from .order_log import log_order_event
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +59,9 @@ class Fill:
     entry_reason: str
     exit_reason: Optional[str]
     market_question: str
-    mode: str            # "paper" or "live"
+    mode: str             # "paper" or "live"
+    execution_mode: str   # "maker" or "taker"
+    maker_fill_optimistic: bool = False  # True when maker limit price < best_ask (resting, not guaranteed fill)
     position_id: Optional[str] = None
 
 
@@ -97,10 +102,30 @@ def paper_fill(decision: Decision, position_id: Optional[str] = None) -> Fill:
     sig = decision.signal
     if has_open_event(sig.event_key):
         raise RuntimeError(f"Refusing duplicate paper fill for open event_key={sig.event_key}")
-    fill_px = _slippage_adjusted_ask(sig.execution_price)
-    estimated_slippage = _slippage_amount(sig.execution_price)
-    notional = round(fill_px * decision.contracts, 4)
-    fee = round(notional * (CONFIG.taker_fee_bps / 10_000.0), 6)
+    is_maker = sig.execution_mode == "maker"
+    if is_maker:
+        # Maker fills at the limit price (already bid + offset from signal_engine);
+        # no slippage adjustment since we're providing liquidity.
+        fill_px = min(0.999, sig.execution_price)
+        estimated_slippage = 0.0
+        notional = round(fill_px * decision.contracts, 4)
+        fee = 0.0
+        rebate = round(notional * taker_fee(fill_px) * CONFIG.maker_rebate_share, 6)
+        exec_mode = "maker"
+    else:
+        fill_px = _slippage_adjusted_ask(sig.execution_price)
+        estimated_slippage = _slippage_amount(sig.execution_price)
+        notional = round(fill_px * decision.contracts, 4)
+        fee = round(notional * taker_fee(fill_px), 6)
+        rebate = 0.0
+        exec_mode = "taker"
+    # Maker is "optimistic" since the limit order is resting in the book and fill is not guaranteed.
+    maker_optimistic = is_maker  # all maker entries are optimistic (assumed fill, not guaranteed)
+    if maker_optimistic:
+        log.debug(
+            "Optimistic maker fill assumed at %.4f for %s %s (limit order may not have filled)",
+            fill_px, sig.asset, sig.side,
+        )
     fill = Fill(
         timestamp=datetime.now(timezone.utc).isoformat(),
         asset=sig.asset,
@@ -134,6 +159,8 @@ def paper_fill(decision: Decision, position_id: Optional[str] = None) -> Fill:
         exit_reason=None,
         market_question=sig.market_question,
         mode="paper",
+        execution_mode=exec_mode,
+        maker_fill_optimistic=maker_optimistic,
         position_id=position_id,
     )
 
@@ -150,11 +177,48 @@ def paper_fill(decision: Decision, position_id: Optional[str] = None) -> Fill:
     return fill
 
 
+def create_paper_order(decision: Decision) -> Optional[PendingOrder]:
+    """Create a pending maker order (order_lifecycle fill model)."""
+    CONFIG.assert_paper_only()
+    sig = decision.signal
+    if has_open_event(sig.event_key):
+        log.warning("Refusing order: open position already exists for event_key=%s", sig.event_key)
+        return None
+    if has_pending_order_for_event(sig.event_key):
+        log.warning("Refusing order: pending order already exists for event_key=%s", sig.event_key)
+        return None
+    order = create_order(sig, decision.position_size_usd, decision.contracts)
+    log_order_event(
+        "ORDER_CREATED",
+        order,
+        current_bid=sig.exit_price,
+        current_ask=sig.entry_price,
+        current_synth_prob=sig.raw_synth_probability,
+        current_calibrated_prob=sig.fair_probability,
+        current_edge=sig.net_edge,
+        current_liquidity=sig.liquidity,
+        time_to_resolution=sig.seconds_to_event_end,
+    )
+    log.info(
+        "Paper order CREATED: %s %s/%s/%s limit=%.4f edge=%.4f",
+        order.order_id[:8], sig.asset, sig.horizon, sig.side,
+        order.limit_price, order.edge_at_order,
+    )
+    return order
+
+
 def execute_decisions(decisions: Iterable[Decision]) -> List[Fill]:
     fills: List[Fill] = []
     for d in decisions:
         if not d.accepted:
             log_skip(d)
+            continue
+        # order_lifecycle: create a pending order instead of an instant fill
+        if CONFIG.maker_fill_model == "order_lifecycle" and d.signal.execution_mode == "maker":
+            try:
+                create_paper_order(d)
+            except Exception as exc:
+                log.warning("Order creation failed: %s", exc)
             continue
         try:
             pos_id = str(uuid.uuid4())

@@ -181,6 +181,35 @@ def _positions_data() -> Dict[str, Any]:
     }
 
 
+def _orders_data() -> Dict[str, Any]:
+    from .order_manager import load_orders
+    orders = load_orders()
+    pending = [o for o in orders if o.status == "PENDING"]
+    filled  = [o for o in orders if o.status == "FILLED"]
+    cancelled = [o for o in orders if o.status == "CANCELLED"]
+    cancel_reasons: Dict[str, int] = {}
+    for o in cancelled:
+        k = o.cancel_reason or "-"
+        cancel_reasons[k] = cancel_reasons.get(k, 0) + 1
+
+    def _fmt_order(o) -> Dict[str, Any]:
+        from dataclasses import asdict
+        d = asdict(o)
+        return d
+
+    return {
+        "pending": [_fmt_order(o) for o in pending],
+        "filled": [_fmt_order(o) for o in filled],
+        "cancelled_recent": [_fmt_order(o) for o in cancelled[-20:]],
+        "counts": {
+            "pending": len(pending),
+            "filled": len(filled),
+            "cancelled": len(cancelled),
+        },
+        "cancel_reasons": cancel_reasons,
+    }
+
+
 def _snapshot_stats() -> Dict[str, Any]:
     if not os.path.exists(CONFIG.snapshot_db_path):
         return {"total": 0, "by_side": {}}
@@ -274,6 +303,14 @@ def api_state():
         "perf": _compute_perf(_load_fills()),
         "positions": _positions_data(),
         "snapshots": _snapshot_stats(),
+        "orders": _orders_data(),
+        "paper_safe": {
+            "paper_trade_mode": CONFIG.paper_trade_mode,
+            "enable_live_trading": CONFIG.enable_live_trading,
+            "live_trading_enabled": False,
+            "simulated": True,
+            "real_orders_enabled": False,
+        },
     })
 
 
@@ -350,6 +387,10 @@ a:hover{text-decoration:underline}
 </head>
 <body>
 
+<div id="safety-banner" style="background:rgba(61,220,151,.1);border:1px solid rgba(61,220,151,.3);border-radius:8px;padding:8px 16px;margin-bottom:14px;font-size:11px;display:flex;align-items:center;gap:12px;">
+  <span style="color:var(--good);font-weight:700;font-size:13px;">✓ PAPER MODE</span>
+  <span style="color:var(--muted)">LIVE ORDERS DISABLED &nbsp;·&nbsp; live_trading_enabled=false &nbsp;·&nbsp; simulated=true &nbsp;·&nbsp; real_orders_enabled=false</span>
+</div>
 <div class="header-row">
   <div>
     <h1>POLYBOT <span id="mode-badge"></span></h1>
@@ -379,6 +420,20 @@ a:hover{text-decoration:underline}
 
 <h2>Exit reasons</h2>
 <div class="card" id="exit-reasons"><div class="empty">no closed positions yet</div></div>
+
+<h2>Pending Paper Orders <span id="pending-count" class="sub"></span></h2>
+<div class="card" style="overflow-x:auto">
+  <table id="pending-tbl">
+    <thead><tr>
+      <th>ID</th><th>Asset</th><th>Hz</th><th>Side</th><th>Limit $</th><th>Size $</th>
+      <th>Edge@order</th><th>Created</th><th>T-to-res</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<h2>Order Lifecycle <span id="order-stats" class="sub"></span></h2>
+<div class="card" id="order-lifecycle-panel"><div class="empty">no orders yet</div></div>
 
 <h2>Recent closed <span id="closed-count" class="sub"></span></h2>
 <div class="card" style="overflow-x:auto">
@@ -581,6 +636,49 @@ function renderScan(accepted, skipped) {
   </tr>`).join("");
 }
 
+// ── orders ────────────────────────────────────────────────────────────────
+function renderOrders(orders) {
+  const counts = orders.counts || {};
+  document.getElementById("pending-count").textContent = `(${counts.pending||0})`;
+  document.getElementById("order-stats").textContent =
+    `${counts.filled||0} filled · ${counts.cancelled||0} cancelled`;
+
+  const tb = document.querySelector("#pending-tbl tbody");
+  const pending = orders.pending || [];
+  if(!pending.length){tb.innerHTML=noRows(9);} else {
+    tb.innerHTML = pending.map(o=>`<tr>
+      <td style="font-family:monospace;font-size:10px">${(o.order_id||"").slice(0,8)}</td>
+      <td><b>${o.asset}</b></td><td>${o.horizon}</td>
+      <td>${sidePill(o.side)}</td>
+      <td>${n4(o.limit_price)}</td>
+      <td>${money(o.size_usd)}</td>
+      <td class="${o.edge_at_order>0.1?"good":""}">${n4(o.edge_at_order)}</td>
+      <td style="font-size:10px">${(o.created_at||"").slice(0,19).replace("T"," ")}</td>
+      <td>${o.time_to_resolution_at_order!=null?Math.round(o.time_to_resolution_at_order)+"s":"—"}</td>
+    </tr>`).join("");
+  }
+
+  const panel = document.getElementById("order-lifecycle-panel");
+  const reasons = orders.cancel_reasons || {};
+  const rEntries = Object.entries(reasons).sort((a,b)=>b[1]-a[1]);
+  if(!rEntries.length && !counts.filled && !counts.cancelled){
+    panel.innerHTML='<div class="empty">no order events yet</div>';
+  } else {
+    const reasonHtml = rEntries.map(([r,c])=>
+      `<span class="reason-pill reason-other">${r} <b>${c}</b></span>`
+    ).join("") || "<span style='color:var(--muted);font-size:11px'>none</span>";
+    panel.innerHTML = `
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:10px">
+        <div><div class="label">Pending</div><div class="value sm">${counts.pending||0}</div></div>
+        <div><div class="label">Filled</div><div class="value sm good">${counts.filled||0}</div></div>
+        <div><div class="label">Cancelled</div><div class="value sm warn">${counts.cancelled||0}</div></div>
+        <div><div class="label">Fill rate</div><div class="value sm">${counts.filled||counts.cancelled?pct((counts.filled||0)/((counts.filled||0)+(counts.cancelled||0))):"—"}</div></div>
+      </div>
+      <div class="label" style="margin-bottom:6px">Cancel reasons</div>
+      ${reasonHtml}`;
+  }
+}
+
 // ── main refresh loop ─────────────────────────────────────────────────────
 let _countdown = 30, _timer = null;
 
@@ -611,6 +709,17 @@ async function refresh() {
 
   const badge = cfg.paper_mode ? '<span class="badge paper">PAPER</span>' : '<span class="badge live">LIVE</span>';
   document.getElementById("mode-badge").innerHTML = badge;
+  const safe = data.paper_safe || {};
+  const banner = document.getElementById("safety-banner");
+  if(safe.live_trading_enabled) {
+    banner.style.background = "rgba(255,107,107,.15)";
+    banner.style.borderColor = "rgba(255,107,107,.4)";
+    banner.innerHTML = '<span style="color:var(--bad);font-weight:700;font-size:13px;">⚠ LIVE TRADING ENABLED</span><span style="color:var(--muted)">Real orders may be placed</span>';
+  } else {
+    banner.style.background = "rgba(61,220,151,.1)";
+    banner.style.borderColor = "rgba(61,220,151,.3)";
+    banner.innerHTML = '<span style="color:var(--good);font-weight:700;font-size:13px;">✓ PAPER MODE</span><span style="color:var(--muted)">LIVE ORDERS DISABLED  ·  live_trading_enabled=false  ·  simulated=true  ·  real_orders_enabled=false</span>';
+  }
   document.getElementById("meta").textContent =
     `${cfg.assets.join("/")} · ${cfg.horizons.join(",")} · entry≥${cfg.min_entry_edge} · exit≥${cfg.min_exit_edge} · bankroll $${cfg.bankroll_usd}` +
     (live.cached?" · scan cached":"");
@@ -622,6 +731,7 @@ async function refresh() {
   renderExitReasons(pos.exit_reasons);
   renderClosed(pos.closed_recent);
   renderScan(live.accepted||[], live.skipped||[]);
+  renderOrders(data.orders || {pending:[], filled:[], cancelled_recent:[], counts:{}, cancel_reasons:{}});
 
   startCountdown();
 }

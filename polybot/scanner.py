@@ -17,25 +17,29 @@ import argparse
 import logging
 import os
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from .config import CONFIG
+from .config import CONFIG, apply_profile, _PROFILES
 from .calibration import write_calibration_report
+from .order_lifecycle import evaluate_pending_orders
 from .clob_enrichment import enrich_real_clob
 from .dashboard import render
-from .exit_rules import evaluate_and_apply_exits
+from .exit_rules import evaluate_and_apply_exits, evaluate_synth_updates
 from .reports import (
     current_report_date,
     daily_report_rows,
     format_daily_report,
     write_daily_report,
     write_strategy_b_reports,
+    strategy_health_report,
 )
 from .execution import execute_decisions
 from .risk_manager import RiskManager
 from .signal_engine import evaluate
+from .trade_log import log_signal
 from .snapshot_store import write_snapshots
 from .synth_client import SynthInsightsClient, configured_horizons
 
@@ -46,6 +50,19 @@ def _setup_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def _cancel_pending_on_restart() -> int:
+    """Cancel all PENDING orders on bot restart (prevents stale orders)."""
+    from .order_manager import get_pending_orders, cancel_order
+    from .order_log import log_order_event
+    pending = get_pending_orders()
+    for order in pending:
+        cancelled = cancel_order(order, "BOT_RESTART")
+        log_order_event("ORDER_CANCELLED", cancelled, reason="BOT_RESTART")
+    if pending:
+        logging.getLogger("scanner").info("Cancelled %d stale PENDING orders on restart", len(pending))
+    return len(pending)
 
 
 def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
@@ -61,16 +78,32 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
     log.info("Snapshots written: %d", len(snapshot_rows))
 
     all_side_signals = evaluate(opps, threshold=-1.0)
+    if CONFIG.maker_fill_model == "order_lifecycle":
+        signal_map = {(s.event_key, s.side): s for s in all_side_signals}
+        filled_orders, cancelled_orders = evaluate_pending_orders(signal_map)
+        if filled_orders:
+            log.info("Order lifecycle: %d orders FILLED", len(filled_orders))
+        if cancelled_orders:
+            log.info("Order lifecycle: %d orders CANCELLED", len(cancelled_orders))
     if execute:
         exits = evaluate_and_apply_exits(all_side_signals)
         if exits:
             log.info("Exit signals written: %d (see %s/exit_signals.jsonl)", len(exits), CONFIG.log_dir)
+        synth_exits = evaluate_synth_updates(all_side_signals)
+        if synth_exits:
+            log.info("Synth-update exits: %d position(s) closed (SYNTH_EV_COLLAPSE)", len(synth_exits))
 
     signals = evaluate(opps)
     log.info("Signals at fair edge threshold %.3f: %d", CONFIG.min_entry_edge, len(signals))
 
     risk = RiskManager(use_kelly=kelly)
     decisions = risk.evaluate(signals)
+    for d in decisions:
+        if d.accepted:
+            log_signal(event_type="ENTRY", signal=d.signal, reason=d.reason,
+                       position_size=d.position_size_usd)
+        else:
+            log_signal(event_type="SKIP", signal=d.signal, reason=d.reason)
     accepted = [d for d in decisions if d.accepted]
     log.info("Decisions: %d accepted / %d total", len(accepted), len(decisions))
 
@@ -180,9 +213,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--execute", action="store_true", help="Write paper fills for accepted signals")
     p.add_argument("--show-skipped", action="store_true", help="Show why signals were rejected")
     p.add_argument("--limit", type=int, default=25, help="Max rows to print")
-    p.add_argument("--kelly", action="store_true", help="Use fractional-Kelly sizing")
+    p.add_argument("--no-kelly", action="store_true", help="Disable fractional-Kelly sizing (Kelly is on by default)")
     p.add_argument("--backtest", nargs=2, metavar=("START_ISO", "END_ISO"),
                    help="Run a historical backtest between two ISO timestamps")
+    p.add_argument("--profile", choices=list(_PROFILES), default=None,
+                   help="Apply a named config profile (paper or live_safe)")
     p.add_argument("--snapshot-backtest", action="store_true",
                    help="Replay stored SQLite snapshots chronologically with Strategy B")
     p.add_argument("--daily-report", nargs="?", const="today", metavar="YYYY-MM-DD",
@@ -191,10 +226,53 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Generate calibration metrics and reliability curves")
     p.add_argument("--strategy-b-report", action="store_true",
                    help="Generate Strategy B positions, exposure, and edge-decay reports")
+    p.add_argument("--strategy-health", action="store_true",
+                   help="Print a dry-run strategy health report: config, exposure, recent signals, exits")
+    p.add_argument("--loop", action="store_true",
+                   help="Run continuously until Ctrl-C")
+    p.add_argument("--interval-seconds", type=int, default=15,
+                   help="Seconds between scans when --loop is used (default 15, minimum 15)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
+    if args.loop:
+        interval = max(15, args.interval_seconds)
+        if args.interval_seconds < 15:
+            logging.getLogger("scanner").warning(
+                "interval_seconds=%d < 15 minimum; using 15s", args.interval_seconds
+            )
+        _setup_logging(args.verbose)
+        log = logging.getLogger("scanner")
+        log.info("Starting paper trading loop: interval=%ds profile=%s", interval, args.profile or "none")
+        if args.profile:
+            apply_profile(CONFIG, args.profile)
+        n_cancelled = _cancel_pending_on_restart()
+        if n_cancelled:
+            log.info("Restart: cancelled %d stale pending orders", n_cancelled)
+        scan_count = 0
+        while True:
+            try:
+                scan_count += 1
+                log.info("─── Scan #%d ───", scan_count)
+                run_scan(execute=True, show_skipped=args.show_skipped,
+                         limit=args.limit, kelly=not args.no_kelly)
+            except KeyboardInterrupt:
+                log.info("Paper trader stopped (KeyboardInterrupt).")
+                break
+            except Exception as exc:
+                log.error("Scan error: %s", exc, exc_info=True)
+            try:
+                time.sleep(interval)
+            except KeyboardInterrupt:
+                log.info("Paper trader stopped during sleep.")
+                break
+        return 0
+
     _setup_logging(args.verbose)
+
+    if args.profile:
+        apply_profile(CONFIG, args.profile)
+        logging.getLogger("scanner").info("Applied config profile: %s", args.profile)
 
     if args.daily_report:
         if args.daily_report == "today":
@@ -220,6 +298,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Saved {label}: {path}")
         return 0
 
+    if args.strategy_health:
+        print(strategy_health_report())
+        return 0
+
     if args.backtest:
         return run_backtest_cli(*args.backtest)
     if args.snapshot_backtest:
@@ -237,7 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Note: {result['note']}")
         print()
         return 0
-    return run_scan(args.execute, args.show_skipped, args.limit, args.kelly)
+    return run_scan(args.execute, args.show_skipped, args.limit, not args.no_kelly)
 
 
 if __name__ == "__main__":

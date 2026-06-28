@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field, fields as dc_fields
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from .config import CONFIG
@@ -40,6 +40,27 @@ class Position:
     exit_reason: Optional[str] = None
     realized_pnl: Optional[float] = None
     low_score_count: int = 0
+    # Scale-in / strategy fields
+    # Polymarket condition_id or token_id (alias kept alongside condition_id for strategy layer).
+    market_id: str = ""
+    # Ordered list of scale-in layers; each entry: {"price", "shares", "order_id", "filled"}.
+    layers: List[Dict[str, Any]] = field(default_factory=list)
+    # Synth probability at the time the first layer was placed.
+    synth_p_at_entry: float = 0.0
+    # Latest Synth probability — refreshed every scan cycle.
+    synth_p_current: float = 0.0
+    # Current fair-value exit target; updated to synth_p_current each cycle.
+    target_exit_price: float = 0.0
+    # Volume-weighted average fill price across all filled layers.
+    avg_entry_price: float = 0.0
+    # True when target_exit_price > avg_entry_price (position has positive expected value).
+    is_ev_positive: bool = False
+    # Set True when Synth signal flips; triggers an immediate taker (emergency) exit.
+    emergency_exit: bool = False
+    # order_id of the currently resting exit limit order (None if none placed).
+    exit_order_id: Optional[str] = None
+    # Absolute ISO timestamp of market resolution; used to compute GTD expiry.
+    market_end_time: Optional[str] = None
 
 
 def _append(row: Dict[str, Any]) -> None:
@@ -61,6 +82,11 @@ def _load_events() -> List[Dict[str, Any]]:
     return rows
 
 
+def _pos_from_dict(data: Dict[str, Any]) -> Position:
+    valid = {f.name for f in dc_fields(Position)}
+    return Position(**{k: v for k, v in data.items() if k in valid})
+
+
 def load_positions(status: Optional[str] = None) -> List[Position]:
     positions: Dict[str, Dict[str, Any]] = {}
     for event in _load_events():
@@ -77,7 +103,7 @@ def load_positions(status: Optional[str] = None) -> List[Position]:
             if pid in positions:
                 positions[pid].update(event.get("fields") or {})
                 positions[pid]["status"] = "closed"
-    out = [Position(**p) for p in positions.values()]
+    out = [_pos_from_dict(p) for p in positions.values()]
     if status:
         out = [p for p in out if p.status == status]
     return out
@@ -89,6 +115,16 @@ def open_positions() -> List[Position]:
 
 def has_open_event(event_key: str) -> bool:
     return any(p.event_key == event_key and p.status == "open" for p in open_positions())
+
+
+def has_traded_market(condition_id: str) -> bool:
+    """Return True if condition_id has any entry in the positions ledger (open or closed)."""
+    if not condition_id:
+        return False
+    for p in load_positions():
+        if p.condition_id == condition_id:
+            return True
+    return False
 
 
 def recently_closed_or_opened(event_key: str, now: Optional[datetime] = None) -> bool:
@@ -126,6 +162,11 @@ def exposure_summary() -> Dict[str, Any]:
 
 def open_position_from_fill(fill: Any, signal: Any, position_id: Optional[str] = None) -> Position:
     now = datetime.now(timezone.utc).isoformat()
+    synth_p = signal.raw_synth_probability
+    secs = getattr(signal, "seconds_to_event_end", None)
+    market_end_time: Optional[str] = None
+    if secs is not None:
+        market_end_time = (datetime.now(timezone.utc) + timedelta(seconds=float(secs))).isoformat()
     position = Position(
         position_id=position_id or str(uuid.uuid4()),
         event_key=signal.event_key,
@@ -139,16 +180,30 @@ def open_position_from_fill(fill: Any, signal: Any, position_id: Optional[str] =
         entry_price=fill.fill_price,
         contracts=fill.contracts,
         notional_usd=fill.notional_usd,
-        entry_raw_synth_probability=signal.raw_synth_probability,
+        entry_raw_synth_probability=synth_p,
         entry_fair_probability=signal.fair_probability,
         entry_edge=signal.net_edge,
         entry_score=signal.score,
-        latest_raw_synth_probability=signal.raw_synth_probability,
+        latest_raw_synth_probability=synth_p,
         latest_fair_probability=signal.fair_probability,
         latest_bid=signal.exit_price,
         latest_ask=signal.entry_price,
         latest_score=signal.score,
         latest_update_time=now,
+        market_id=signal.condition_id,
+        layers=[{
+            "price": fill.fill_price,
+            "shares": fill.contracts,
+            "order_id": getattr(fill, "order_id", ""),
+            "filled": True,
+        }],
+        synth_p_at_entry=synth_p,
+        synth_p_current=synth_p,
+        target_exit_price=synth_p,
+        avg_entry_price=fill.fill_price,
+        is_ev_positive=synth_p > fill.fill_price,
+        emergency_exit=False,
+        market_end_time=market_end_time,
     )
     _append({"type": "open", "position": asdict(position)})
     return position
