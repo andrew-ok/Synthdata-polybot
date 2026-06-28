@@ -219,7 +219,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--profile", choices=list(_PROFILES), default=None,
                    help="Apply a named config profile (paper or live_safe)")
     p.add_argument("--snapshot-backtest", action="store_true",
-                   help="Replay stored SQLite snapshots chronologically with Strategy B")
+                   help="Replay stored SQLite snapshots chronologically with Strategy B "
+                        "(no Synth API calls — safe to run anytime)")
     p.add_argument("--daily-report", nargs="?", const="today", metavar="YYYY-MM-DD",
                    help="Print and save a daily paper-trade report")
     p.add_argument("--calibration-report", action="store_true",
@@ -230,16 +231,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Print a dry-run strategy health report: config, exposure, recent signals, exits")
     p.add_argument("--loop", action="store_true",
                    help="Run continuously until Ctrl-C")
-    p.add_argument("--interval-seconds", type=int, default=15,
-                   help="Seconds between scans when --loop is used (default 15, minimum 15)")
+    p.add_argument("--interval-seconds", type=int, default=300,
+                   help="Seconds between scans when --loop is used (default 300 / 5 min). "
+                        "Synth API costs 2 tokens per cycle (one per horizon). "
+                        "At 20k tokens/month the safe floor is ~260s. Minimum enforced: 60s.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
     if args.loop:
-        interval = max(15, args.interval_seconds)
-        if args.interval_seconds < 15:
+        interval = max(60, args.interval_seconds)
+        if args.interval_seconds < 60:
             logging.getLogger("scanner").warning(
-                "interval_seconds=%d < 15 minimum; using 15s", args.interval_seconds
+                "interval_seconds=%d < 60 minimum; using 60s. "
+                "At 20k Synth tokens/month the safe interval is ~260s.",
+                args.interval_seconds,
             )
         _setup_logging(args.verbose)
         log = logging.getLogger("scanner")
