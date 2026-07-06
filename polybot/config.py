@@ -288,12 +288,25 @@ LIVE_SAFE_PROFILE: Dict[str, Any] = {
 }
 
 LATE_WINDOW_PROFILE: Dict[str, Any] = {
-    # Replicates the Synth post strategy:
-    # Enter 1H contracts with <20 min remaining where market is already 75¢+
-    # and Synth says ≥10% higher. Convergence is nearly guaranteed in 20 min.
-    "min_entry_edge": 0.08,            # ~10% raw edge minus ~2% fees
-    "min_synth_conviction": 0.82,      # Synth must be highly confident
-    "min_entry_price": 0.75,           # only buy contracts market already prices at 75¢+
+    # Replicates the Synth post strategy, parameters re-tuned 2026-07-05 from
+    # an 8-week backtest (May 8 - Jul 3, 2,231 late-window hourly windows,
+    # thinkpadsynthbot branch: c_sweep/edge_curve/c_steal). Key findings:
+    #   - 70-75c was one of the two BEST price buckets (+0.07/$1, 6/8 weeks
+    #     positive) — the old 0.75 floor excluded it entirely.
+    #   - Required reported edge rises with price (~1.5pp at 70c -> ~6pp at
+    #     90c). A flat 0.08 floor filtered toward Synth's OVERCONFIDENT calls:
+    #     big disagreements underperformed small ones at every price above
+    #     0.75 (their-exact-profile: +$60 cum over 8wk; this tuning: ~5x more
+    #     trades at equal-or-better avg, ~+$330 cum at $37.50 stakes).
+    #   - Entries above ~0.92 were NEGATIVE EV in every edge bin (the old
+    #     profile had NO price cap and would buy 96c contracts).
+    #   - Conviction floors consistently subtracted (RAMP+conv>=.82 lost $30
+    #     vs RAMP alone +$327); 0.73 is implied by price+edge anyway, so the
+    #     floor below is effectively documentation, not a binding gate.
+    "min_entry_edge": 0.03,            # was 0.08 — see required-edge curve above
+    "min_synth_conviction": 0.73,      # was 0.82 — conviction floors tested negative
+    "min_entry_price": 0.70,           # was 0.75 — captures the 70-75c bucket
+    "max_entry_price": 0.92,           # NEW — above this, all edge bins were -EV
     "max_seconds_to_event_end": 1200.0,  # enter only in the last 20 minutes
     "min_seconds_to_enter": 120.0,     # but at least 2 min to close
     "time_stop_seconds": 60.0,
