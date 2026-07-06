@@ -133,6 +133,8 @@ def format_report() -> str:
         ("C-RAMP", _book(_load_fills("fills_C_ramp.jsonl"), taker=False, min_edge=0.0)),
         ("C 70-75c", _book(_load_fills("fills_C_b7075.jsonl"), taker=False, min_edge=0.0)),
         ("C 80-85c", _book(_load_fills("fills_C_b8085.jsonl"), taker=False, min_edge=0.0)),
+        ("C-VETO", _book(_load_fills("fills_C_veto.jsonl"), taker=False, min_edge=0.0)),
+        ("C-RAMP+P", _book(_load_fills("fills_C_rampp.jsonl"), taker=False, min_edge=0.0)),
     ]
     W = 18
     lines = [

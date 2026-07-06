@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
 from .config import CONFIG
@@ -41,8 +41,18 @@ C_VARIANTS = [
      lambda p, e: 0.70 <= p < 0.75 and e >= 0.015),
     ("C_B8085", "fills_C_b8085.jsonl",
      lambda p, e: 0.80 <= p < 0.85 and e >= 0.03),
+    # G2 SYNTH-VETO (strategy_gen, 8wk: +$665, 6/8 wks, 492 trades): buy ANY
+    # late favorite unless Synth disagrees by >2pp. Synth as veto, not trigger —
+    # pure-favorite with no Synth was -$125, so the veto IS the edge.
+    ("C_VETO",  "fills_C_veto.jsonl",
+     lambda p, e: 0.70 <= p <= 0.92 and e >= -0.02),
+    # G7 RAMP+PAUSE (8wk: +$529, 6/8 wks): RAMP entries, but run_c stands this
+    # book down for 24h after 3 resolved losses within 24h (loss clustering).
+    ("C_RAMPP", "fills_C_rampp.jsonl",
+     lambda p, e: 0.70 <= p <= 0.92 and e >= 0.015 + 0.22 * (p - 0.70)),
 ]
-C_CANDIDATE_MIN_EDGE = 0.01   # generation floor; variant rules tighten from here
+PAUSED_VARIANTS = {"C_RAMPP": (3, 24.0)}      # ledger -> (losses, window hours)
+C_CANDIDATE_MIN_EDGE = -0.02  # admits veto-range candidates; variants tighten
 
 # All tunable via env so C can be re-shaped without code changes.
 C_MIN_EDGE = float(os.environ.get("C_MIN_EDGE", "0.07"))
@@ -158,11 +168,17 @@ def evaluate_c(opps: List[Opportunity]) -> List[Signal]:
     return out
 
 
-def _fill_c(sig: Signal) -> Dict:
-    """Size (Kelly, capped) and paper-fill a C signal into a ledger row that
-    settlement.py and the report understand."""
-    frac = _kelly_size(sig.calibrated_probability, sig.execution_price, CONFIG.kelly_fraction)
-    frac = min(CONFIG.max_position_size, frac)
+def _fill_c(sig: Signal, flat: bool = False) -> Dict:
+    """Size and paper-fill a C signal into a ledger row that settlement.py and
+    the report understand. flat=True uses the position cap directly — required
+    for veto-style books whose entries can have negative SYNTH edge (Kelly on
+    Synth's prob would zero them out, but the mechanism prices off the MARKET
+    probability; the backtest that validated G2 used flat stakes)."""
+    if flat:
+        frac = CONFIG.max_position_size
+    else:
+        frac = _kelly_size(sig.calibrated_probability, sig.execution_price, CONFIG.kelly_fraction)
+        frac = min(CONFIG.max_position_size, frac)
     confidence = min(CONFIG.max_confidence_position_multiplier,
                      max(CONFIG.model_confidence_floor, sig.model_confidence))
     frac = min(CONFIG.max_position_size, frac * confidence)
@@ -204,6 +220,36 @@ def _fill_c(sig: Signal) -> Dict:
     }
 
 
+def _loss_streak_paused(ledger: str, max_losses: int, window_hours: float) -> bool:
+    """True if the ledger has >= max_losses resolved losses within the trailing
+    window — the G7 stand-down: losses cluster in unfavorable regimes."""
+    path = _ledger_path(ledger)
+    if not os.path.exists(path):
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    losses = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pnl = row.get("realized_pnl")
+                ts = row.get("resolution_timestamp") or row.get("exit_timestamp")
+                if pnl is None or not ts:
+                    continue
+                try:
+                    when = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if when >= cutoff and float(pnl) < 0:
+                    losses += 1
+    except OSError:
+        return False
+    return losses >= max_losses
+
+
 def run_c(opps: List[Opportunity], client: Optional[SynthInsightsClient] = None) -> Dict[str, int]:
     """Full C cycle for ALL live variants: settle each variant's open positions,
     then route new candidates to every variant whose rule they satisfy (the same
@@ -222,6 +268,9 @@ def run_c(opps: List[Opportunity], client: Optional[SynthInsightsClient] = None)
 
     candidates = evaluate_c(opps)
     for name, ledger, rule in C_VARIANTS:
+        if name in PAUSED_VARIANTS and _loss_streak_paused(ledger, *PAUSED_VARIANTS[name]):
+            log.info("%s: paused (loss streak) — skipping entries this cycle", name)
+            continue
         opened = _opened_condition_ids(ledger)
         path = _ledger_path(ledger)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -232,7 +281,7 @@ def run_c(opps: List[Opportunity], client: Optional[SynthInsightsClient] = None)
                 cid = (sig.condition_id or sig.slug or "").strip()
                 if cid and cid in opened:
                     continue
-                row = _fill_c(sig)
+                row = _fill_c(sig, flat=(name == "C_VETO"))
                 if row:
                     row["strategy"] = name
                     f.write(json.dumps(row, sort_keys=True) + "\n")
