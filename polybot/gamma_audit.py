@@ -26,7 +26,8 @@ SAMPLE_EVERY = 11   # every 11th hourly window -> ~30 samples/period/asset
 def gamma_outcome(slug: str):
     url = f"{CONFIG.polymarket_gamma_url}/markets?slug={slug}&closed=true"
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "polybot/0.2"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
     except Exception:
         return None
