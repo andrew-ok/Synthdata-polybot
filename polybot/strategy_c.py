@@ -50,8 +50,20 @@ C_VARIANTS = [
     # book down for 24h after 3 resolved losses within 24h (loss clustering).
     ("C_RAMPP", "fills_C_rampp.jsonl",
      lambda p, e: 0.70 <= p <= 0.92 and e >= 0.015 + 0.22 * (p - 0.70)),
+    # H5 VETO+PAUSE (8wk: +$854 best cum, +0.06/$ best avg, 6/8): veto entries
+    # with the same loss-streak stand-down.
+    ("C_VETOP", "fills_C_vetop.jsonl",
+     lambda p, e: 0.70 <= p <= 0.92 and e >= -0.02),
+    # H2 HIGH-VOL VETO (8wk: 7/8 weeks positive — best consistency; maxDD -151
+    # vs -268): veto entries only in hours whose EARLY move exceeded ~median
+    # (0.10%). Momentum literature: predictability concentrates in high-vol
+    # windows. Needs the early-move memory written at the :02 scans.
+    ("C_HVOL", "fills_C_hvol.jsonl",
+     lambda p, e: 0.70 <= p <= 0.92 and e >= -0.02),
 ]
-PAUSED_VARIANTS = {"C_RAMPP": (3, 24.0)}      # ledger -> (losses, window hours)
+PAUSED_VARIANTS = {"C_RAMPP": (3, 24.0), "C_VETOP": (3, 24.0)}
+HVOL_VARIANTS = {"C_HVOL": 0.001}             # ledger -> min |early move|
+FLAT_SIZED = {"C_VETO", "C_VETOP", "C_HVOL"}  # veto-family books use flat stakes
 C_CANDIDATE_MIN_EDGE = -0.02  # admits veto-range candidates; variants tighten
 
 # All tunable via env so C can be re-shaped without code changes.
@@ -220,6 +232,47 @@ def _fill_c(sig: Signal, flat: bool = False) -> Dict:
     }
 
 
+_EARLY_STATE = "early_moves.json"
+
+
+def _record_early_moves(opps: List[Opportunity]) -> None:
+    """At early scans (~:02), remember each 1H window's early move so the :47
+    entry scan can apply the high-vol filter. Keyed asset|window-start ISO."""
+    path = os.path.join(CONFIG.log_dir, _EARLY_STATE)
+    state: Dict[str, float] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        pass
+    changed = False
+    for opp in opps:
+        if opp.horizon.upper() != "1H" or not opp.start_price or not opp.current_price:
+            continue
+        age = (opp.current_time - opp.event_start_time).total_seconds()
+        if not (0 <= age <= 420):
+            continue
+        key = f"{opp.asset}|{opp.event_start_time.isoformat()}"
+        if key not in state:
+            state[key] = (opp.current_price - opp.start_price) / opp.start_price
+            changed = True
+    if changed:
+        os.makedirs(CONFIG.log_dir, exist_ok=True)
+        keep = dict(sorted(state.items())[-200:])   # bound the file
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(keep, f)
+
+
+def _early_move(sig: Signal) -> Optional[float]:
+    path = os.path.join(CONFIG.log_dir, _EARLY_STATE)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return state.get(f"{sig.asset}|{sig.event_start_time}")
+
+
 def _loss_streak_paused(ledger: str, max_losses: int, window_hours: float) -> bool:
     """True if the ledger has >= max_losses resolved losses within the trailing
     window — the G7 stand-down: losses cluster in unfavorable regimes."""
@@ -266,6 +319,8 @@ def run_c(opps: List[Opportunity], client: Optional[SynthInsightsClient] = None)
             for k in ("exit_at_fair", "resolution", "pending"):
                 totals[k] += s[k]
 
+    _record_early_moves(opps)
+
     candidates = evaluate_c(opps)
     for name, ledger, rule in C_VARIANTS:
         if name in PAUSED_VARIANTS and _loss_streak_paused(ledger, *PAUSED_VARIANTS[name]):
@@ -278,10 +333,14 @@ def run_c(opps: List[Opportunity], client: Optional[SynthInsightsClient] = None)
             for sig in candidates:
                 if not rule(sig.execution_price, sig.raw_edge):
                     continue
+                if name in HVOL_VARIANTS:
+                    em = _early_move(sig)
+                    if em is None or abs(em) <= HVOL_VARIANTS[name]:
+                        continue
                 cid = (sig.condition_id or sig.slug or "").strip()
                 if cid and cid in opened:
                     continue
-                row = _fill_c(sig, flat=(name == "C_VETO"))
+                row = _fill_c(sig, flat=(name in FLAT_SIZED))
                 if row:
                     row["strategy"] = name
                     f.write(json.dumps(row, sort_keys=True) + "\n")

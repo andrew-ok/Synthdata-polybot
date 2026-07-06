@@ -129,18 +129,16 @@ def _book(rows: List[Dict[str, Any]], taker: bool, min_edge: float) -> Dict[str,
 
 def format_report() -> str:
     # Live test = the three C variants (A/B execution retired 2026-07-05).
-    cols = [
-        ("C-RAMP", _book(_load_fills("fills_C_ramp.jsonl"), taker=False, min_edge=0.0)),
-        ("C 70-75c", _book(_load_fills("fills_C_b7075.jsonl"), taker=False, min_edge=0.0)),
-        ("C 80-85c", _book(_load_fills("fills_C_b8085.jsonl"), taker=False, min_edge=0.0)),
-        ("C-VETO", _book(_load_fills("fills_C_veto.jsonl"), taker=False, min_edge=0.0)),
-        ("C-RAMP+P", _book(_load_fills("fills_C_rampp.jsonl"), taker=False, min_edge=0.0)),
-    ]
-    W = 18
+    books = [("RAMP", "fills_C_ramp.jsonl"), ("70-75c", "fills_C_b7075.jsonl"),
+             ("80-85c", "fills_C_b8085.jsonl"), ("VETO", "fills_C_veto.jsonl"),
+             ("RAMP+P", "fills_C_rampp.jsonl"), ("VETO+P", "fills_C_vetop.jsonl"),
+             ("HVOL", "fills_C_hvol.jsonl")]
+    cols = [(name, _book(_load_fills(f), taker=False, min_edge=0.0)) for name, f in books]
+    W = 12
     lines = [
-        "**LIVE TEST — three Strategy C variants (A/B retired 2026-07-05)**",
-        "(hourly favorites, last 20min | RAMP: edge 1.5pp@70c->5.9pp@90c | "
-        "70-75c @ >=1.5pp | 80-85c @ >=3pp)",
+        "**LIVE TEST — seven Strategy C books (all late-window hourly favorites)**",
+        "(RAMP price-scaled edge | two 5c buckets | VETO family: any favorite unless "
+        "Synth disagrees >2pp | +P = 24h pause after 3 losses | HVOL = high-vol hours only)",
         "",
         f"{'':22s}" + "".join(f"{name:>{W}s}" for name, _ in cols),
     ]
