@@ -10,6 +10,32 @@ from dataclasses import dataclass, field
 from typing import List
 
 
+def _load_dotenv() -> None:
+    """Load .env into os.environ (no external dependency; on Windows there is
+    no `source .env`). Existing env vars win. Searches the repo root (parent
+    of this package) then the current working directory."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for candidate in (os.path.join(here, ".env"), os.path.join(os.getcwd(), ".env")):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key, val = key.strip(), val.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+        except OSError:
+            pass
+        break
+
+
+_load_dotenv()
+
+
 def _env(name: str, default: str | None = None, required: bool = False) -> str | None:
     val = os.environ.get(name, default)
     if required and not val:
@@ -75,6 +101,16 @@ class Config:
     max_entry_age_15m_sec: float = field(default_factory=lambda: _env_float("MAX_ENTRY_AGE_15M_SEC", 180.0))
     max_entry_age_1h_sec: float = field(default_factory=lambda: _env_float("MAX_ENTRY_AGE_1H_SEC", 600.0))
     min_seconds_to_event_end: float = field(default_factory=lambda: _env_float("MIN_SECONDS_TO_EVENT_END", 180.0))
+    # Synth miner forecasts refresh ~every 15 min (per synth-subnet repo). A
+    # stale forecast next to a freshly-moved market shows a huge fake "edge".
+    max_forecast_age_sec: float = field(default_factory=lambda: _env_float("MAX_FORECAST_AGE_SEC", 600.0))
+    # Contracts priced near 0/1 are decided markets where edge and slippage
+    # models are meaningless (a live fill once bought a 0.1c "65c edge" 12s
+    # after window close). Trade only inside this band.
+    min_execution_price: float = field(default_factory=lambda: _env_float("MIN_EXECUTION_PRICE", 0.05))
+    max_execution_price: float = field(default_factory=lambda: _env_float("MAX_EXECUTION_PRICE", 0.95))
+    # Label recorded on fills; the base spec quotes maker-style at the ask.
+    entry_style: str = field(default_factory=lambda: _env("ENTRY_STYLE", "maker") or "maker")
 
     # --- Slippage model (paper trading) ---
     assumed_slippage_bps: float = field(default_factory=lambda: _env_float("ASSUMED_SLIPPAGE_BPS", 50.0))  # 0.5 cents on a $1 contract

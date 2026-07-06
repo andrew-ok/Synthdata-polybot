@@ -14,12 +14,18 @@ from .config import CONFIG
 log = logging.getLogger(__name__)
 
 
-def _tz() -> ZoneInfo:
+def _tz() -> "ZoneInfo | timezone":
+    """Resolve the report timezone. On Windows (no system IANA db) this needs
+    the `tzdata` package; if it's missing entirely, fall back to fixed UTC so a
+    report never crashes."""
     try:
         return ZoneInfo(CONFIG.report_timezone)
-    except ZoneInfoNotFoundError:
-        log.warning("Unknown REPORT_TIMEZONE=%r; using UTC", CONFIG.report_timezone)
-        return ZoneInfo("UTC")
+    except (ZoneInfoNotFoundError, ModuleNotFoundError, KeyError):
+        log.warning("Timezone %r unavailable (install tzdata); using UTC", CONFIG.report_timezone)
+        try:
+            return ZoneInfo("UTC")
+        except (ZoneInfoNotFoundError, ModuleNotFoundError, KeyError):
+            return timezone.utc
 
 
 def load_fills() -> List[Dict[str, Any]]:
@@ -76,10 +82,13 @@ def daily_report_rows(report_date: date) -> Dict[str, Any]:
         "losses": 0,
         "open": 0,
         "notional": 0.0,
+        "realized_pnl": 0.0,
     })
-    total = {"trades": 0, "wins": 0, "losses": 0, "open": 0, "notional": 0.0}
+    total = {"trades": 0, "wins": 0, "losses": 0, "open": 0, "notional": 0.0, "realized_pnl": 0.0}
 
     for row in load_fills():
+        if row.get("voided"):
+            continue
         ts = _parse_ts(row)
         if ts is None:
             continue
@@ -91,10 +100,15 @@ def daily_report_rows(report_date: date) -> Dict[str, Any]:
         bucket = by_asset[asset]
         win = _is_win(row)
         notional = float(row.get("notional_usd") or 0.0)
+        try:
+            realized = float(row.get("realized_pnl")) if row.get("realized_pnl") is not None else 0.0
+        except (TypeError, ValueError):
+            realized = 0.0
 
         for target in (bucket, total):
             target["trades"] += 1
             target["notional"] += notional
+            target["realized_pnl"] += realized
             if win is True:
                 target["wins"] += 1
             elif win is False:
@@ -121,7 +135,8 @@ def format_daily_report(report: Dict[str, Any]) -> str:
         (
             f"Total: `{total['trades']}` trades | "
             f"W `{total['wins']}` / L `{total['losses']}` / Open `{total['open']}` | "
-            f"Notional `${total['notional']:.2f}`"
+            f"Notional `${total['notional']:.2f}` | "
+            f"Realized PnL `${total['realized_pnl']:+.2f}`"
         ),
     ]
     if not report["by_asset"]:
@@ -134,7 +149,7 @@ def format_daily_report(report: Dict[str, Any]) -> str:
         lines.append(
             f"- `{asset}`: `{row['trades']}` trades | "
             f"W `{row['wins']}` / L `{row['losses']}` / Open `{row['open']}` | "
-            f"`${row['notional']:.2f}`"
+            f"`${row['notional']:.2f}` | PnL `${row['realized_pnl']:+.2f}`"
         )
     return "\n".join(lines)
 

@@ -24,7 +24,7 @@ from .config import CONFIG
 from .calibration import write_calibration_report
 from .clob_enrichment import enrich_real_clob
 from .dashboard import render
-from .exit_rules import evaluate_open_exits
+from .settlement import settle_positions
 from .reports import (
     current_report_date,
     daily_report_rows,
@@ -56,9 +56,10 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
     log.info("Opportunities: %d  (assets=%s)", len(opps), CONFIG.synth_assets)
 
     if execute:
-        exits = evaluate_open_exits(opps)
-        if exits:
-            log.info("Exit signals written: %d (see %s/exit_signals.jsonl)", len(exits), CONFIG.log_dir)
+        settled = settle_positions(opps, client)
+        if settled["exit_at_fair"] or settled["resolution"]:
+            log.info("Settled: %d exit-at-fair, %d at resolution, %d pending",
+                     settled["exit_at_fair"], settled["resolution"], settled["pending"])
 
     signals = evaluate(opps)
     log.info("Signals at raw threshold %.2f: %d", CONFIG.min_edge_threshold, len(signals))
@@ -71,8 +72,21 @@ def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
     render(decisions, show_skipped=show_skipped, limit=limit)
 
     if execute:
-        fills = execute_decisions(decisions)
-        log.info("Paper-trade fills written: %d (see %s)", len(fills), CONFIG.log_dir)
+        # A/B live testing RETIRED (user directive 2026-07-05): the 8-week
+        # backtests showed no edge for A/B, so execution now runs only the
+        # Strategy C variants. A's signal/gate pipeline above still runs for
+        # logging and for settling any legacy open A fills.
+        settled_a = settle_positions(opps, client)
+        if settled_a["resolution"] or settled_a["exit_at_fair"]:
+            log.info("Legacy A ledger settled: %d resolved", settled_a["resolution"])
+
+        try:
+            from .strategy_c import run_c
+            c = run_c(opps, client)
+            if c["fills"] or c["resolution"]:
+                log.info("C variants: %d fills, %d settled this cycle", c["fills"], c["resolution"])
+        except Exception as exc:  # noqa: BLE001 — C isolation preserved
+            log.warning("Strategy C pass failed: %s", exc)
 
     return 0 if accepted else 1
 

@@ -189,6 +189,10 @@ class Opportunity:
     no_ask_price: Optional[float] = None
     no_bid_size: float = 0.0
     no_ask_size: float = 0.0
+    # USD depth within 2c of the best ask (from CLOB enrichment) — truer
+    # executable liquidity than top-of-book size alone.
+    yes_ask_liquidity_usd: Optional[float] = None
+    no_ask_liquidity_usd: Optional[float] = None
 
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -238,6 +242,11 @@ class SynthInsightsClient:
             url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         try:
             resp = self.session.get(url, timeout=self.timeout)
+            if resp.status_code == 429:
+                # one retry after a short backoff — a missed :47 scan costs a
+                # late-window strategy its only shot at that hour
+                time.sleep(2.5)
+                resp = self.session.get(url, timeout=self.timeout)
         except requests.RequestException as exc:
             log.warning("Synth GET %s failed: %s", path, exc)
             _record_call(False, path, params)

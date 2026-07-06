@@ -29,6 +29,12 @@ log = logging.getLogger(__name__)
 # How often events fire per horizon.
 _HORIZON_STEP_SEC = {"15M": 15 * 60, "1H": 60 * 60}
 
+# Seconds into a window to request the entry snapshot. Synth serves the forecast
+# at/just before the requested time; requesting the exact boundary returns the
+# prior window. ~150s in gives the best single-request early-forecast yield while
+# staying inside our live 180s entry window.
+_ENTRY_OFFSET_SEC = 150.0
+
 
 @dataclass
 class _Stats:
@@ -71,13 +77,17 @@ def _max_drawdown(curve: List[float]) -> float:
 
 
 def _sharpe_proxy(curve: List[float]) -> float:
+    """Per-trade Sharpe = mean/std of per-trade PnL. NOT scaled by sqrt(N) — the
+    old sqrt(N) factor made this a t-statistic, so best_threshold() would rank a
+    lower threshold higher purely for trading more often at equal per-trade
+    quality. Per-trade Sharpe is the comparable statistic across thresholds."""
     if len(curve) < 2:
         return 0.0
     rets = [curve[i] - curve[i - 1] for i in range(1, len(curve))]
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / len(rets)
     std = math.sqrt(var)
-    return (mean / std) * math.sqrt(len(rets)) if std > 1e-9 else 0.0
+    return (mean / std) if std > 1e-9 else 0.0
 
 
 def _iso_zulu(dt: datetime) -> str:
@@ -175,27 +185,50 @@ def run_backtest(
         events = _walk(start, end, step)
         log.info("Backtest %s: %d windows × %d assets = %d calls",
                  horizon, len(events), len(assets), len(events) * len(assets))
-        for event_start in events:
-            iso = _iso_zulu(event_start)
-            for asset in assets:
-                opp = client.fetch(asset, horizon, start_time=iso)
+        step_td = timedelta(seconds=step)
+        max_lag = max(CONFIG.max_backtest_snapshot_lag_sec, _ENTRY_OFFSET_SEC + 90.0)
+        for asset in assets:
+            # Phase 1: one request per window (offset INTO the window, since the
+            # exact boundary returns the prior window). Synth's forecast for a
+            # window isn't always published early, so a request can still return
+            # the prior window's late snapshot — so we BIN each result by its
+            # ACTUAL event_start_time (from the payload), not by what we asked
+            # for, and keep the smallest-lag (earliest) snapshot per window.
+            by_window: Dict[datetime, Dict] = {}
+            for event_start in events:
+                req = _iso_zulu(event_start + timedelta(seconds=_ENTRY_OFFSET_SEC))
+                opp = client.fetch(asset, horizon, start_time=req)
                 if request_delay_sec:
                     time.sleep(request_delay_sec)
                 if opp is None:
                     continue
                 total_pulled += 1
-                lag_sec = (opp.current_time - opp.event_start_time).total_seconds()
-                if lag_sec > CONFIG.max_backtest_snapshot_lag_sec:
-                    skipped_late += 1
+                w = opp.event_start_time
+                rec = by_window.setdefault(w, {"start_price": None, "entry": None, "lag": None})
+                if opp.start_price:
+                    rec["start_price"] = opp.start_price
+                lag = (opp.current_time - opp.event_start_time).total_seconds()
+                if 0 <= lag <= max_lag and (rec["entry"] is None or lag < rec["lag"]):
+                    rec["entry"] = opp
+                    rec["lag"] = lag
+
+            # Phase 2: for each window that has an early entry snapshot, resolve
+            # its outcome from the SUCCESSOR window's start_price (= this window's
+            # actual close price), looked up by true window time — not by request
+            # order, which can be misaligned.
+            for w in sorted(by_window):
+                rec = by_window[w]
+                opp = rec["entry"]
+                if opp is None or not rec["start_price"]:
+                    if opp is None:
+                        skipped_late += 1
                     continue
-                label = opp.resolved_outcome
-                if label is None and CONFIG.allow_current_outcome_backtest_label:
-                    label = opp.current_outcome
-                outcome = str(label or "").strip().lower()
-                if outcome not in ("up", "down"):
+                succ = by_window.get(w + step_td)
+                if succ is None or not succ["start_price"] or succ["start_price"] == rec["start_price"]:
                     skipped_unresolved += 1
                     continue
-                resolved_up = outcome == "up"
+                resolved_up = succ["start_price"] > rec["start_price"]
+                iso = _iso_zulu(w)
                 append_observation(CalibrationObservation(
                     timestamp=iso,
                     asset=asset,
@@ -204,7 +237,7 @@ def run_backtest(
                     realized_outcome="UP" if resolved_up else "DOWN",
                     source="backtest",
                 ))
-                holding_period_sec = (opp.event_end_time - opp.current_time).total_seconds()
+                holding_period_sec = max(0.0, (opp.event_end_time - opp.current_time).total_seconds())
 
                 recorded_signal_observation = False
                 for t in thresholds:

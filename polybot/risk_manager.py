@@ -12,10 +12,27 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set
 
+from datetime import datetime, timezone
+
 from .config import CONFIG
 from .signal_engine import Signal
 
 log = logging.getLogger(__name__)
+
+
+def _wall_clock_seconds_to_end(sig: Signal) -> Optional[float]:
+    """Seconds to event end measured against OUR clock, not the payload's.
+    Synth payloads can be minutes stale server-side (observed: 4.5 min), which
+    once let a fill through 12s after the window closed."""
+    if not sig.event_end_time:
+        return None
+    try:
+        end = datetime.fromisoformat(sig.event_end_time.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return (end - datetime.now(timezone.utc)).total_seconds()
 
 
 @dataclass
@@ -122,10 +139,10 @@ class RiskManager:
         return decisions
 
     def _gates(self, sig: Signal) -> tuple[bool, str]:
-        # Rule 2: raw edge >= 20pp.
+        # Rule 2: raw edge >= threshold (Strategy E: 30pp taker entries).
         if sig.raw_edge < CONFIG.min_edge_threshold:
             return False, f"raw edge {sig.raw_edge:.3f} < {CONFIG.min_edge_threshold:.2f}"
-        # Rule 3: net edge >= 12pp after fees/slippage.
+        # Rule 3: net edge >= threshold after taker fee + slippage.
         if sig.net_edge < CONFIG.min_net_edge_threshold:
             return False, f"net edge {sig.net_edge:.3f} < {CONFIG.min_net_edge_threshold:.2f}"
         # Rule 4: spread <= 5pp.
@@ -138,10 +155,27 @@ class RiskManager:
         max_age = CONFIG.max_entry_age_15m_sec if sig.horizon == "15M" else CONFIG.max_entry_age_1h_sec
         if sig.event_age_sec is not None and sig.event_age_sec > max_age:
             return False, f"event age {sig.event_age_sec:.0f}s > max entry age {max_age:.0f}s"
+        # Stale-forecast guard: a big "edge" against a fresh market move is
+        # usually Synth's ~15-min refresh lag, not real mispricing.
+        if (
+            CONFIG.max_forecast_age_sec > 0
+            and sig.forecast_age_sec is not None
+            and sig.forecast_age_sec > CONFIG.max_forecast_age_sec
+        ):
+            return False, (
+                f"forecast {sig.forecast_age_sec:.0f}s old "
+                f"> max {CONFIG.max_forecast_age_sec:.0f}s (stale-edge risk)"
+            )
         if sig.seconds_to_event_end is not None and sig.seconds_to_event_end < CONFIG.min_seconds_to_event_end:
             return False, (
                 f"only {sig.seconds_to_event_end:.0f}s to close "
                 f"< min {CONFIG.min_seconds_to_event_end:.0f}s"
+            )
+        wall_sec = _wall_clock_seconds_to_end(sig)
+        if wall_sec is not None and wall_sec < CONFIG.min_seconds_to_event_end:
+            return False, (
+                f"wall-clock {wall_sec:.0f}s to close "
+                f"< min {CONFIG.min_seconds_to_event_end:.0f}s (stale payload clock)"
             )
         if (
             CONFIG.min_hours_to_resolution > 0
@@ -151,13 +185,20 @@ class RiskManager:
             return False, f"only {sig.hours_to_resolution:.1f}h to resolution"
         if CONFIG.allowed_categories and sig.category and sig.category not in CONFIG.allowed_categories:
             return False, f"category '{sig.category}' not in allowlist"
-        if sig.execution_price <= 0 or sig.execution_price >= 1:
-            return False, f"degenerate ask {sig.execution_price}"
+        if not (CONFIG.min_execution_price <= sig.execution_price <= CONFIG.max_execution_price):
+            return False, (
+                f"price {sig.execution_price:.3f} outside "
+                f"[{CONFIG.min_execution_price:.2f}, {CONFIG.max_execution_price:.2f}] "
+                f"(decided market / lottery ticket)"
+            )
         return True, ""
 
     def _size(self, sig: Signal) -> tuple[float, float]:
         if self.use_kelly:
-            frac = _kelly_size(sig.calibrated_probability, sig.execution_price, CONFIG.kelly_fraction)
+            # Kelly must see the all-in taker cost, not the raw ask.
+            eff_price = min(0.999, sig.execution_price
+                            * (1.0 + (CONFIG.taker_fee_bps + CONFIG.assumed_slippage_bps) / 10_000.0))
+            frac = _kelly_size(sig.calibrated_probability, eff_price, CONFIG.kelly_fraction)
             frac = min(frac, CONFIG.max_position_size)
         else:
             frac = CONFIG.max_position_size

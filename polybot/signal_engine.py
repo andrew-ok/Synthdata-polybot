@@ -52,9 +52,12 @@ class Signal:
     hours_to_resolution: Optional[float]
     event_age_sec: Optional[float]
     seconds_to_event_end: Optional[float]
+    forecast_age_sec: Optional[float]
     threshold: float
     category: str = "crypto"
     reason: str = "insights"
+    event_start_time: str = ""      # ISO — settlement uses these to resolve
+    event_end_time: str = ""        # the window after it closes
 
 
 def _net(raw: float) -> float:
@@ -96,6 +99,12 @@ def evaluate(
         htr = opp.hours_to_event_end
         event_age_sec = opp.event_age_sec
         seconds_to_event_end = opp.seconds_to_event_end
+        forecast_age_sec = (
+            (opp.current_time - opp.forecast_start_time).total_seconds()
+            if opp.forecast_start_time is not None else None
+        )
+        event_start_iso = opp.event_start_time.isoformat() if opp.event_start_time else ""
+        event_end_iso = opp.event_end_time.isoformat() if opp.event_end_time else ""
 
         # --- Up leg ---
         if opp.best_ask_price is not None:
@@ -103,7 +112,11 @@ def evaluate(
             synth_up = opp.synth_probability_up
             cal_up = calibrator.calibrate(opp.asset, opp.horizon, synth_up)
             edge_up = cal_up - ask_up
-            liquidity_up = opp.best_ask_size * ask_up
+            liquidity_up = (
+                opp.yes_ask_liquidity_usd
+                if opp.yes_ask_liquidity_usd is not None
+                else opp.best_ask_size * ask_up
+            )
             if edge_up >= thr:
                 signals.append(Signal(
                     asset=opp.asset, horizon=opp.horizon, slug=opp.slug,
@@ -125,6 +138,9 @@ def evaluate(
                     hours_to_resolution=htr,
                     event_age_sec=event_age_sec,
                     seconds_to_event_end=seconds_to_event_end,
+                    forecast_age_sec=forecast_age_sec,
+                    event_start_time=event_start_iso,
+                    event_end_time=event_end_iso,
                     threshold=thr,
                 ))
 
@@ -133,7 +149,11 @@ def evaluate(
             ask_down = opp.no_ask_price
             bid_down = opp.no_bid_price or 0.0
             spread_down = _spread(opp.no_bid_price, opp.no_ask_price)
-            liquidity_down = opp.no_ask_size * ask_down
+            liquidity_down = (
+                opp.no_ask_liquidity_usd
+                if opp.no_ask_liquidity_usd is not None
+                else opp.no_ask_size * ask_down
+            )
             reason = "real_down_clob"
         elif opp.best_bid_price is not None:
             implied_down_ask = max(0.0, min(1.0, 1.0 - opp.best_bid_price))
@@ -171,6 +191,9 @@ def evaluate(
                     hours_to_resolution=htr,
                     event_age_sec=event_age_sec,
                     seconds_to_event_end=seconds_to_event_end,
+                    forecast_age_sec=forecast_age_sec,
+                    event_start_time=event_start_iso,
+                    event_end_time=event_end_iso,
                     threshold=thr,
                     reason=reason,
                 ))

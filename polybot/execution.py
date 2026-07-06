@@ -43,11 +43,21 @@ class Fill:
     expected_value_score: float
     market_question: str
     mode: str            # "paper" or "live"
+    entry_style: str = "taker"
+    event_start_time: str = ""   # ISO — window this position resolves on
+    event_end_time: str = ""
+    # --- settlement fields (written later by settlement.py; absent = open) ---
+    # resolved_outcome: "UP"/"DOWN" | exit_timestamp / exit_price / exit_reason
+    # | realized_pnl (USD) | close_kind: "exit_at_fair" | "resolution"
 
 
-def _slippage_adjusted_ask(ask: float) -> float:
-    slip = CONFIG.assumed_slippage_bps / 10_000.0
-    return min(0.999, ask + slip)
+def _taker_fill_price(ask: float) -> float:
+    """Effective cost per contract for a taker entry: ask + slippage + taker
+    fee. Both are PROPORTIONAL to price (true bps) — absolute slippage was
+    500% of price on a 0.1c contract and inflated notional 6x past the cap."""
+    slip = (CONFIG.assumed_slippage_bps / 10_000.0) * ask
+    fee = (CONFIG.taker_fee_bps / 10_000.0) * ask
+    return min(0.999, ask + slip + fee)
 
 
 def _ensure_logdir() -> str:
@@ -76,8 +86,14 @@ def log_skip(decision: Decision) -> None:
 def paper_fill(decision: Decision) -> Fill:
     CONFIG.assert_paper_only()
     sig = decision.signal
-    fill_px = _slippage_adjusted_ask(sig.execution_price)
-    notional = round(fill_px * decision.contracts, 4)
+    fill_px = _taker_fill_price(sig.execution_price)
+    # Hard cap: notional at the ALL-IN fill price may never exceed the position
+    # limit, no matter what price the contracts were originally sized against.
+    contracts = decision.contracts
+    max_pos_usd = CONFIG.max_position_size * CONFIG.bankroll_usd
+    if fill_px * contracts > max_pos_usd:
+        contracts = round(max_pos_usd / fill_px, 4)
+    notional = round(fill_px * contracts, 4)
     fill = Fill(
         timestamp=datetime.now(timezone.utc).isoformat(),
         asset=sig.asset,
@@ -90,7 +106,7 @@ def paper_fill(decision: Decision) -> Fill:
         calibrated_probability=sig.calibrated_probability,
         intended_price=sig.execution_price,
         fill_price=fill_px,
-        contracts=decision.contracts,
+        contracts=contracts,
         notional_usd=notional,
         raw_edge=sig.raw_edge,
         calibrated_edge=sig.calibrated_edge,
@@ -99,6 +115,9 @@ def paper_fill(decision: Decision) -> Fill:
         expected_value_score=sig.expected_value_score,
         market_question=sig.market_question,
         mode="paper",
+        entry_style=CONFIG.entry_style,
+        event_start_time=sig.event_start_time,
+        event_end_time=sig.event_end_time,
     )
 
     log_dir = _ensure_logdir()

@@ -39,8 +39,15 @@ def _is_win(side: str, realized_outcome: str) -> bool:
 
 
 def append_observation(obs: CalibrationObservation) -> None:
-    os.makedirs(os.path.dirname(CONFIG.calibration_db_path), exist_ok=True)
-    with open(CONFIG.calibration_db_path, "a", encoding="utf-8") as f:
+    """Live observations go to the live DB; backtest-sourced observations are
+    quarantined to a separate file. Mixing them once disabled 3 of 4 live
+    segments and calibrated favorites to coin flips, silently halting trading."""
+    path = CONFIG.calibration_db_path
+    if str(obs.source or "").startswith("backtest"):
+        base, ext = os.path.splitext(path)
+        path = f"{base}_backtest{ext}"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(asdict(obs), sort_keys=True) + "\n")
 
 
@@ -93,12 +100,16 @@ def _returns(rows: Iterable[CalibrationObservation]) -> List[float]:
 
 
 def _sharpe(values: List[float]) -> float:
+    """Per-trade Sharpe = mean/std of per-trade returns. NOT scaled by sqrt(N):
+    that would make it a t-statistic that grows with sample count for identical
+    performance, which silently rewards higher-frequency (lower-threshold)
+    segments in the backtest and inflates model_confidence as trades accrue."""
     if len(values) < 2:
         return 0.0
     mean = sum(values) / len(values)
     var = sum((x - mean) ** 2 for x in values) / len(values)
     std = math.sqrt(var)
-    return (mean / std) * math.sqrt(len(values)) if std > 1e-9 else 0.0
+    return (mean / std) if std > 1e-9 else 0.0
 
 
 def _brier(rows: List[CalibrationObservation]) -> float:

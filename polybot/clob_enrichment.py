@@ -32,7 +32,8 @@ def enrich_real_clob(opportunities: Iterable[Opportunity]) -> List[Opportunity]:
         yes_book = client.fetch_book(market.token_id_yes)
         no_book = client.fetch_book(market.token_id_no)
         if yes_book:
-            yb, ya, _, ybs, yas = client._best_levels(yes_book)
+            yb, ya, yliq, ybs, yas = client._best_levels(yes_book)
+            opp.yes_ask_liquidity_usd = yliq
             opp.yes_bid_price = yb
             opp.yes_ask_price = ya
             opp.yes_bid_size = ybs
@@ -45,7 +46,8 @@ def enrich_real_clob(opportunities: Iterable[Opportunity]) -> List[Opportunity]:
             if ya is not None:
                 enriched_yes += 1
         if no_book:
-            nb, na, _, nbs, nas = client._best_levels(no_book)
+            nb, na, nliq, nbs, nas = client._best_levels(no_book)
+            opp.no_ask_liquidity_usd = nliq
             opp.no_bid_price = nb
             opp.no_ask_price = na
             opp.no_bid_size = nbs
