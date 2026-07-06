@@ -214,17 +214,43 @@ def update_position(position_id: str, **fields: Any) -> None:
     _append({"type": "update", "position_id": position_id, "fields": fields})
 
 
-def close_position(position: Position, exit_price: float, exit_reason: str) -> Position:
-    now = datetime.now(timezone.utc).isoformat()
-    pnl = round((exit_price * position.contracts) - position.notional_usd, 4)
-    fields = {
-        "status": "closed",
-        "exit_time": now,
-        "exit_price": exit_price,
-        "exit_reason": exit_reason,
-        "realized_pnl": pnl,
-    }
-    _append({"type": "close", "position_id": position.position_id, "fields": fields})
-    data = asdict(position)
-    data.update(fields)
-    return Position(**data)
+def close_position(position: Position, exit_price: float, exit_reason: str) -> Optional[Position]:
+    """Close a position; returns None if it was already closed (duplicate).
+
+    Two scanner processes share this ledger and can both decide to close the
+    same position within milliseconds. An exclusive flock makes the
+    read-check-append sequence atomic across processes — the loser of the race
+    re-reads the ledger under the lock, sees status=closed, and backs off.
+    """
+    import fcntl
+    import logging
+
+    lock_path = CONFIG.positions_path + ".lock"
+    os.makedirs(os.path.dirname(CONFIG.positions_path), exist_ok=True)
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            current = {p.position_id: p for p in load_positions()}
+            existing = current.get(position.position_id)
+            if existing is not None and existing.status == "closed":
+                logging.getLogger(__name__).warning(
+                    "close_position: %s already closed (reason=%s) — skipping duplicate close",
+                    position.position_id[:8], existing.exit_reason,
+                )
+                return None
+
+            now = datetime.now(timezone.utc).isoformat()
+            pnl = round((exit_price * position.contracts) - position.notional_usd, 4)
+            fields = {
+                "status": "closed",
+                "exit_time": now,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "realized_pnl": pnl,
+            }
+            _append({"type": "close", "position_id": position.position_id, "fields": fields})
+            data = asdict(position)
+            data.update(fields)
+            return Position(**data)
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)

@@ -232,7 +232,7 @@ def run_backtest(
 
     client = SynthInsightsClient()
     gamma_client = PolymarketClient()
-    calibrator = Calibrator()
+    calibrator = Calibrator(live_only=False)
     total_pulled = 0
     skipped_late = 0
     skipped_unresolved = 0
@@ -269,7 +269,7 @@ def run_backtest(
                     labels_synth += 1
                 else:
                     gamma_label, gamma_src, _gamma_reason = resolve_final_outcome_from_gamma(
-                        opp.slug, gamma_client
+                        opp.slug, client=gamma_client
                     )
                     if gamma_label is not None:
                         label = gamma_label
@@ -323,6 +323,15 @@ def run_backtest(
                 recorded_signal_observation = False
                 for t in thresholds:
                     for sig in evaluate([opp], threshold=t, calibrator=calibrator):
+                        # Conviction gate: mirror the live scanner. Historical backtest was
+                        # missing this — it was counting low-conviction noise as valid signals.
+                        if CONFIG.min_synth_conviction > 0:
+                            conviction_dist = abs(sig.raw_synth_probability - 0.5)
+                            if conviction_dist < (CONFIG.min_synth_conviction - 0.5):
+                                continue
+                        # Contrarian gate: only buy contracts priced below max_entry_price.
+                        if CONFIG.max_entry_price < float("inf") and sig.execution_price > CONFIG.max_entry_price:
+                            continue
                         if not recorded_signal_observation:
                             append_observation(CalibrationObservation(
                                 timestamp=iso,
@@ -418,7 +427,7 @@ def run_snapshot_backtest(snapshot_db_path: Optional[str] = None) -> Dict[str, o
         out["note"] = "snapshot database does not exist"
         return out
 
-    calibrator = Calibrator()
+    calibrator = Calibrator(live_only=False)
     open_by_event: Dict[str, _ReplayPosition] = {}
     slip = CONFIG.assumed_slippage_bps / 10_000.0
     position_size = CONFIG.bankroll_usd * CONFIG.max_position_size

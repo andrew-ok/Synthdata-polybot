@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
+from .calibration import CalibrationObservation, append_observation
 from .config import CONFIG
 from .order_log import log_order_event
 from .order_manager import cancel_order, create_exit_order, get_order_by_id, get_pending_orders
@@ -87,7 +88,8 @@ def _exit_reason(position: Position, same_side: Optional[Signal], opposite: Opti
     probability is confirmation Synth was right — not a reason to exit early.
 
     Exit triggers (in priority order):
-    1. STALE_DATA    — no CLOB data at all; can't manage the position.
+    1. STALE_DATA    — Synth dropped this market from its feed. Caller will
+                       attempt Gamma resolution before using this reason.
     2. TIME_STOP     — near-resolution simulation: at < time_stop_seconds (30s),
                        the market price is a reliable proxy for the resolution
                        payout. Exit here to book PnL in paper mode.
@@ -118,6 +120,91 @@ def _exit_reason(position: Position, same_side: Optional[Signal], opposite: Opti
     return None
 
 
+# Hours past market_end_time before we force-close an unresolvable position.
+_FORCE_EXIT_TIMEOUT_HOURS = 4.0
+
+
+def _resolve_stale_position(position: Position) -> tuple:
+    """Query Gamma for the final outcome of a position whose Synth data has gone stale.
+
+    Returns (reason, bid, fill_px) where:
+      - reason is "RESOLVED_WIN", "RESOLVED_LOSS", "FORCE_EXIT_TIMEOUT", or "STALE_DATA"
+      - bid is the notional exit bid (1.0, 0.0, or position.latest_bid)
+      - fill_px is the net fill price after fees
+
+    Resolution logic:
+      1. Ask Gamma for the market outcome by slug, with condition_id as fallback.
+      2. If resolved: book WIN at $1.00/contract or LOSS at $0.00/contract (exact
+         resolution payout — no taker fee applies to Polymarket redemptions).
+      3. If unresolved but market_end_time + 4h has elapsed: force-close at $0.00
+         (conservative — treats voided/disputed markets as a full loss).
+      4. Otherwise: fall back to STALE_DATA with the last known bid (legacy behavior).
+    """
+    from .gamma_resolver import resolve_final_outcome_from_gamma
+
+    outcome, source, detail = resolve_final_outcome_from_gamma(
+        position.slug, condition_id=position.condition_id
+    )
+
+    if outcome is not None:
+        position_won = (outcome == position.side)
+        reason = "RESOLVED_WIN" if position_won else "RESOLVED_LOSS"
+        bid = 1.0 if position_won else 0.0
+        fill_px = 1.0 if position_won else 0.0
+        log.info(
+            "Resolution: %s %s/%s → %s via %s  fill=%.3f",
+            position.position_id[:8], position.asset, position.side,
+            reason, source, fill_px,
+        )
+        return reason, bid, fill_px
+
+    # Gamma could not confirm resolution. Check for force-exit timeout.
+    if position.market_end_time:
+        try:
+            end_dt = datetime.fromisoformat(position.market_end_time)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            hours_past = (datetime.now(timezone.utc) - end_dt).total_seconds() / 3600.0
+            if hours_past >= _FORCE_EXIT_TIMEOUT_HOURS:
+                log.warning(
+                    "Force-exit timeout: %s %s/%s — %.1fh past market_end_time, "
+                    "Gamma source=%s (%s). Closing at $0 (conservative).",
+                    position.position_id[:8], position.asset, position.side,
+                    hours_past, source, detail,
+                )
+                return "FORCE_EXIT_TIMEOUT", 0.0, 0.0
+        except (TypeError, ValueError):
+            pass
+
+    # RL exit policy: if the market still has meaningful time remaining, hold instead
+    # of exiting at a depressed stale bid. EV(hold) = p_win×(1−entry) > EV(stale_exit)
+    # whenever p_win > entry, which is guaranteed by our entry gate.
+    if position.market_end_time:
+        try:
+            end_dt = datetime.fromisoformat(position.market_end_time)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            secs_remaining = (end_dt - datetime.now(timezone.utc)).total_seconds()
+            if secs_remaining > CONFIG.stale_hold_min_secs:
+                log.info(
+                    "STALE_HOLD: %s %s/%s — %.0fs remaining, holding (EV > stale exit)",
+                    position.position_id[:8], position.asset, position.side, secs_remaining,
+                )
+                return None, None, None
+        except (TypeError, ValueError):
+            pass
+
+    # Gamma unresolved and market expired (or no end time) — fall back to stale bid.
+    bid = position.latest_bid
+    fill_px = _exit_fill_price(bid)
+    log.debug(
+        "STALE_DATA fallback: %s %s/%s  gamma=%s (%s)  stale_bid=%.4f",
+        position.position_id[:8], position.asset, position.side,
+        source, detail, bid,
+    )
+    return "STALE_DATA", bid, fill_px
+
+
 def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
     signal_map: Dict[tuple[str, str], Signal] = {(s.event_key, s.side): s for s in signals}
     decisions: List[ExitDecision] = []
@@ -138,11 +225,28 @@ def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
                 )
             continue
 
-        bid = same_side.exit_price if same_side is not None else position.latest_bid
-        fair = same_side.fair_probability if same_side is not None else position.latest_fair_probability
-        score = same_side.score if same_side is not None else position.latest_score
-        fill_px = _exit_fill_price(bid)
+        # When STALE_DATA fires, Synth dropped this market from its feed.
+        # _resolve_stale_position() queries Gamma first; if market hasn't resolved
+        # and has time remaining, returns None (STALE_HOLD — keep the position).
+        if reason == "STALE_DATA":
+            stale_reason, stale_bid, stale_fill = _resolve_stale_position(position)
+            if stale_reason is None:
+                # RL hold: positive EV to ride out remaining window time.
+                continue
+            reason, bid, fill_px = stale_reason, stale_bid, stale_fill
+            fair = position.latest_fair_probability
+            score = position.latest_score
+        else:
+            bid = same_side.exit_price if same_side is not None else position.latest_bid
+            fair = same_side.fair_probability if same_side is not None else position.latest_fair_probability
+            score = same_side.score if same_side is not None else position.latest_score
+            fill_px = _exit_fill_price(bid)
+
         closed = close_position(position, fill_px, reason)
+        if closed is None:
+            # Another scanner process closed this position first — skip all
+            # follow-up logging so exit signals/fills/calibration obs aren't duplicated.
+            continue
         decision = ExitDecision(
             timestamp=datetime.now(timezone.utc).isoformat(),
             position_id=position.position_id,
@@ -152,7 +256,7 @@ def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
             fair_probability=fair,
             exit_bid=bid,
             exit_fill_price=fill_px,
-            hold_edge=fair - bid - _exit_cost(bid),
+            hold_edge=0.0 if reason in ("RESOLVED_WIN", "RESOLVED_LOSS", "FORCE_EXIT_TIMEOUT") else fair - bid - _exit_cost(bid),
             score=score,
             realized_pnl=closed.realized_pnl or 0.0,
         )
@@ -160,6 +264,41 @@ def evaluate_and_apply_exits(signals: Iterable[Signal]) -> List[ExitDecision]:
         _append_fill(position, decision)
         log_exit(position=position, decision=decision, signal=same_side)
         decisions.append(decision)
+        # Record live calibration observation for definitive resolution outcomes.
+        # RESOLVED_WIN/RESOLVED_LOSS come from Gamma's actual binary payout — ground truth.
+        # These feed the Calibrator and will replace the stale backtest data over time.
+        if reason in ("RESOLVED_WIN", "RESOLVED_LOSS"):
+            position_won = (reason == "RESOLVED_WIN")
+            realized_outcome = position.side if position_won else (
+                "DOWN" if position.side == "UP" else "UP"
+            )
+            # Compute entry_window_age_sec from slug timestamp (btc-updown-15m-<unix>).
+            entry_window_age_sec = None
+            try:
+                parts = (position.slug or "").rsplit("-", 1)
+                if len(parts) == 2:
+                    market_start_ts = int(parts[1])
+                    entry_dt = datetime.fromisoformat(position.entry_time)
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                    market_start_dt = datetime.fromtimestamp(market_start_ts, tz=timezone.utc)
+                    entry_window_age_sec = (entry_dt - market_start_dt).total_seconds()
+            except Exception:
+                pass
+            try:
+                append_observation(CalibrationObservation(
+                    timestamp=decision.timestamp,
+                    asset=position.asset,
+                    horizon=position.horizon,
+                    predicted_probability=position.entry_raw_synth_probability,
+                    realized_outcome=realized_outcome,
+                    ask_price=position.entry_price,
+                    side=position.side,
+                    source="live",
+                    entry_window_age_sec=entry_window_age_sec,
+                ))
+            except Exception as exc:
+                log.warning("Failed to record live calibration obs: %s", exc)
     return decisions
 
 
@@ -310,7 +449,10 @@ def evaluate_synth_updates(signals: Iterable[Signal]) -> List[ExitDecision]:
         if sig is None:
             continue
 
-        action = on_synth_update(position, sig.raw_synth_probability)
+        # on_synth_update expects Synth's UP probability. For DOWN/NO signals,
+        # raw_synth_probability is the DOWN probability — convert to UP probability.
+        synth_p_up = sig.raw_synth_probability if position.side in ("YES", "UP") else (1.0 - sig.raw_synth_probability)
+        action = on_synth_update(position, synth_p_up)
         current_bid = sig.exit_price
 
         if action == "exit":
@@ -322,6 +464,9 @@ def evaluate_synth_updates(signals: Iterable[Signal]) -> List[ExitDecision]:
                 )
             fill_px = _exit_fill_price(current_bid)
             closed = close_position(position, fill_px, "SYNTH_EV_COLLAPSE")
+            if closed is None:
+                # Duplicate close from the other scanner process — skip logging.
+                continue
             decision = ExitDecision(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 position_id=position.position_id,
@@ -346,38 +491,50 @@ def evaluate_synth_updates(signals: Iterable[Signal]) -> List[ExitDecision]:
             )
 
         elif action == "update_target":
-            # Stamp updated exit_order_price on the last layer so on_synth_update's
-            # 1¢ churn guard sees the price we actually posted.
-            updated_layers = list(position.layers)
-            updated_layers[-1] = {
-                **updated_layers[-1],
-                "exit_order_price": position.target_exit_price,
-            }
-            # Refresh market_end_time from the current signal before (re-)placing.
+            market_end_time = position.market_end_time
             if sig.seconds_to_event_end is not None:
-                position.market_end_time = (
+                market_end_time = (
                     datetime.now(timezone.utc)
                     + timedelta(seconds=float(sig.seconds_to_event_end))
                 ).isoformat()
-            update_position(
-                position.position_id,
-                synth_p_current=position.synth_p_current,
-                target_exit_price=position.target_exit_price,
-                is_ev_positive=position.is_ev_positive,
-                layers=updated_layers,
-                market_end_time=position.market_end_time,
-            )
-            try:
-                place_exit_order(position)
-            except Exception as exc:
-                log.warning(
-                    "place_exit_order failed for %s: %s",
-                    position.position_id[:8], exc,
+            # UP/DOWN (Strategy B hold-to-resolution) positions don't use resting
+            # exit orders — exits are handled by evaluate_and_apply_exits. Skip
+            # place_exit_order to avoid wrong limit prices from the UP-probability
+            # convention used by on_synth_update's target_exit_price field.
+            if position.side in ("UP", "DOWN"):
+                update_position(
+                    position.position_id,
+                    synth_p_current=position.synth_p_current,
+                    is_ev_positive=position.is_ev_positive,
+                    market_end_time=market_end_time,
                 )
+            else:
+                # Scale-in YES/NO positions: stamp updated exit_order_price on the
+                # last layer so on_synth_update's 1¢ churn guard sees the posted price.
+                updated_layers = list(position.layers)
+                updated_layers[-1] = {
+                    **updated_layers[-1],
+                    "exit_order_price": position.target_exit_price,
+                }
+                update_position(
+                    position.position_id,
+                    synth_p_current=position.synth_p_current,
+                    target_exit_price=position.target_exit_price,
+                    is_ev_positive=position.is_ev_positive,
+                    layers=updated_layers,
+                    market_end_time=market_end_time,
+                )
+                try:
+                    place_exit_order(position)
+                except Exception as exc:
+                    log.warning(
+                        "place_exit_order failed for %s: %s",
+                        position.position_id[:8], exc,
+                    )
             log.debug(
-                "update_target: %s %s/%s new_exit_limit=%.4f",
+                "update_target: %s %s/%s synth_p_up=%.4f",
                 position.position_id[:8], position.asset, position.side,
-                position.target_exit_price,
+                position.synth_p_current,
             )
 
         else:  # "hold" — persist the refreshed Synth probability only

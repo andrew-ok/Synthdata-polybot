@@ -53,6 +53,26 @@ def _kelly_size(prob: float, price: float, fraction: float) -> float:
     return max(0.0, min(CONFIG.max_kelly_fraction, fraction * k))
 
 
+def _adaptive_kelly_fraction() -> float:
+    """Scale Kelly fraction by live calibration confidence.
+
+    cold_start (0 live obs):  50% of configured kelly_fraction — uncertain signal.
+    warming_up (1–29 obs):    ramps 50% → 100% linearly as evidence accumulates.
+    live (30+ obs):           full configured kelly_fraction — calibration is reliable.
+    """
+    from .calibration import Calibrator
+    cal = Calibrator()
+    n = cal.live_count
+    min_n = CONFIG.min_calibration_samples
+    if n == 0:
+        scale = 0.5
+    elif n < min_n:
+        scale = 0.5 + 0.5 * (n / min_n)
+    else:
+        scale = 1.0
+    return CONFIG.kelly_fraction * scale
+
+
 class RiskManager:
     def __init__(self, use_kelly: bool = False):
         self.use_kelly = use_kelly
@@ -216,6 +236,12 @@ class RiskManager:
                 f"entry price {sig.execution_price:.3f} < min_entry_price "
                 f"{CONFIG.min_entry_price:.3f} (contract not yet heavily priced)"
             )
+        # Contrarian gate: only buy contracts the market underprices (crowd disagrees with Synth).
+        if CONFIG.max_entry_price < float("inf") and sig.execution_price > CONFIG.max_entry_price:
+            return False, (
+                f"entry price {sig.execution_price:.3f} > max_entry_price "
+                f"{CONFIG.max_entry_price:.3f} (not a contrarian underdog buy)"
+            )
         if (
             CONFIG.min_hours_to_resolution > 0
             and sig.hours_to_resolution is not None
@@ -230,7 +256,7 @@ class RiskManager:
 
     def _size(self, sig: Signal) -> tuple[float, float]:
         if self.use_kelly:
-            frac = _kelly_size(sig.calibrated_probability, sig.execution_price, CONFIG.kelly_fraction)
+            frac = _kelly_size(sig.calibrated_probability, sig.execution_price, _adaptive_kelly_fraction())
             frac = min(frac, CONFIG.max_position_size)
         else:
             frac = CONFIG.max_position_size

@@ -2,6 +2,17 @@
 
 The calibration store is intentionally file-backed JSONL. Each observation is
 one historical prediction for an asset/horizon and the final realized outcome.
+
+Live vs backtest split
+----------------------
+Historical backtests flood the observation file with stale-archive data that
+shows ~50% win rate at every conviction level (Synth signal is already repriced
+before archive queries). Loading those observations into the live Calibrator
+shrinks every DOWN edge toward 50%, destroying apparent alpha.
+
+``Calibrator(live_only=True)`` (the default) filters out all backtest-sourced
+rows and falls back to ``raw_low_sample`` (fair = raw Synth probability) until
+live fills accumulate. This is correct: we're in a cold-start regime.
 """
 from __future__ import annotations
 
@@ -15,6 +26,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import CONFIG
 
+# Sources produced by offline backtesting — these observations use stale
+# archive data where Synth's signal is already repriced into the market,
+# making them uninformative for live calibration.
+_BACKTEST_SOURCES: frozenset = frozenset({
+    "backtest",
+    "backtest_signal",
+    "historical_synth",
+})
+
 
 @dataclass
 class CalibrationObservation:
@@ -26,6 +46,9 @@ class CalibrationObservation:
     ask_price: Optional[float] = None
     side: str = "UP"
     source: str = "historical_synth"
+    # RL feature: seconds into the market window when the position was entered.
+    # Early-window entries (120–300s) may have better calibration than late entries.
+    entry_window_age_sec: Optional[float] = None
 
 
 @dataclass
@@ -224,8 +247,18 @@ def segment_metrics(rows: Optional[List[CalibrationObservation]] = None) -> Dict
 
 
 class Calibrator:
-    def __init__(self, observations: Optional[List[CalibrationObservation]] = None):
-        self.observations = observations if observations is not None else load_observations()
+    def __init__(
+        self,
+        observations: Optional[List[CalibrationObservation]] = None,
+        live_only: bool = True,
+    ):
+        all_obs = observations if observations is not None else load_observations()
+        self._all_count = len(all_obs)
+        if live_only:
+            self.observations = [r for r in all_obs if r.source not in _BACKTEST_SOURCES]
+        else:
+            self.observations = all_obs
+        self._live_only = live_only
         self._by_segment: Dict[Tuple[str, str], List[CalibrationObservation]] = defaultdict(list)
         self._by_segment_side: Dict[Tuple[str, str, str], List[CalibrationObservation]] = defaultdict(list)
         self._global_by_side: Dict[str, List[CalibrationObservation]] = defaultdict(list)
@@ -235,6 +268,19 @@ class Calibrator:
                 self._by_segment_side[(row.asset.upper(), row.horizon, row.side.upper())].append(row)
                 self._global_by_side[row.side.upper()].append(row)
         self._metrics = segment_metrics(self.observations)
+
+    @property
+    def live_count(self) -> int:
+        return len(self.observations)
+
+    @property
+    def calibration_mode(self) -> str:
+        n = self.live_count
+        if n == 0:
+            return "cold_start"
+        if n < CONFIG.min_calibration_samples:
+            return f"warming_up({n})"
+        return f"live({n})"
 
     def calibrate_side(self, asset: str, horizon: str, side: str, predicted_probability: float) -> CalibrationResult:
         p = _clamp(predicted_probability)

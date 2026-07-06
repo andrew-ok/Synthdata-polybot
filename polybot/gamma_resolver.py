@@ -98,41 +98,8 @@ def _try_winner_fields(raw: Dict[str, Any]) -> Tuple[Optional[str], str]:
     return None, "no conclusive winner field found"
 
 
-def resolve_final_outcome_from_gamma(
-    slug: str,
-    client: Any = None,
-) -> Tuple[Optional[str], str, str]:
-    """Return (label, source, reason) for a Polymarket event slug.
-
-    label:  "UP", "DOWN", or None if unresolved.
-    source: "gamma_prices", "gamma_winner",
-            "cache:gamma_prices", "cache:gamma_winner",
-            "unresolved", "not_found", "no_slug", "gamma_error"
-    reason: human-readable detail for logging/debugging.
-    """
-    if not slug:
-        return None, "no_slug", "empty slug"
-
-    cached = _load_cache(slug)
-    if cached is not None:
-        orig_src = cached.get("source", "gamma")
-        return cached.get("label"), f"cache:{orig_src}", cached.get("reason", "")
-
-    if client is None:
-        from .polymarket_client import PolymarketClient
-        client = PolymarketClient()
-
-    try:
-        market = client.market_by_slug(slug)
-    except Exception as exc:
-        log.debug("gamma_resolver: Gamma API error for %s: %s", slug, exc)
-        return None, "gamma_error", str(exc)
-
-    if market is None:
-        return None, "not_found", f"slug not found in Gamma: {slug}"
-
-    raw: Dict[str, Any] = market.raw or {}
-
+def _resolve_from_raw(raw: Dict[str, Any], slug: str) -> Tuple[Optional[str], str, str]:
+    """Try both resolution strategies on a raw Gamma market dict."""
     label, reason = _try_outcome_prices(raw)
     if label is not None:
         _save_cache(slug, label, "gamma_prices", reason)
@@ -147,3 +114,77 @@ def resolve_final_outcome_from_gamma(
 
     full_reason = f"outcomePrices: {prices_reason}; winner fields: {reason}"
     return None, "unresolved", full_reason
+
+
+def resolve_final_outcome_from_gamma(
+    slug: str,
+    condition_id: Optional[str] = None,
+    client: Any = None,
+) -> Tuple[Optional[str], str, str]:
+    """Return (label, source, reason) for a Polymarket market.
+
+    Looks up by slug first; falls back to condition_id if slug lookup
+    returns nothing (resolved markets are sometimes purged from Gamma's
+    active index but remain queryable by condition_id).
+
+    label:  "UP", "DOWN", or None if unresolved.
+    source: "gamma_prices", "gamma_winner",
+            "cache:gamma_prices", "cache:gamma_winner",
+            "unresolved", "not_found", "no_slug", "gamma_error"
+    reason: human-readable detail for logging/debugging.
+    """
+    if not slug and not condition_id:
+        return None, "no_slug", "empty slug and condition_id"
+
+    cache_key = slug or condition_id or ""
+    cached = _load_cache(cache_key)
+    if cached is not None:
+        orig_src = cached.get("source", "gamma")
+        return cached.get("label"), f"cache:{orig_src}", cached.get("reason", "")
+
+    if client is None:
+        from .polymarket_client import PolymarketClient
+        client = PolymarketClient()
+
+    # --- Primary: slug lookup (tries active, closed, and direct endpoints) ---
+    if slug:
+        try:
+            market = client.market_by_slug(slug)
+        except Exception as exc:
+            log.debug("gamma_resolver: slug lookup error for %s: %s", slug, exc)
+            market = None
+
+        if market is not None:
+            return _resolve_from_raw(market.raw or {}, cache_key)
+
+    # --- Fallback: condition_id lookup for resolved markets purged from slug index ---
+    if condition_id:
+        gamma_url = client.gamma_url
+        for params in (
+            {"conditionId": condition_id},
+            {"conditionId": condition_id, "closed": "true"},
+        ):
+            try:
+                resp = client.session.get(
+                    f"{gamma_url}/markets", params=params, timeout=client.timeout
+                )
+                if not resp.ok:
+                    continue
+                data = resp.json()
+                items = data if isinstance(data, list) else (
+                    data.get("data") or data.get("markets") or
+                    ([data] if isinstance(data, dict) and data.get("conditionId") else [])
+                )
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = item.get("conditionId") or item.get("condition_id") or ""
+                    if cid != condition_id:
+                        continue
+                    label, src, reason = _resolve_from_raw(item, cache_key)
+                    if label is not None:
+                        return label, src, reason
+            except Exception as exc:
+                log.debug("gamma_resolver: condition_id lookup error %s: %s", condition_id, exc)
+
+    return None, "not_found", f"not found in Gamma: slug={slug!r} condition_id={condition_id!r}"

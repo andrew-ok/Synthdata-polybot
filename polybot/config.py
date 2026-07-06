@@ -150,6 +150,13 @@ class Config:
     synth_horizons_sec: List[int] = field(default_factory=lambda: [
         int(x) for x in (_env("SYNTH_HORIZONS_SEC", "900,3600") or "").split(",") if x.strip().isdigit()
     ])
+    # Sides to evaluate ("UP", "DOWN", or both). Snapshot data shows DOWN has
+    # 30-42% of scans with >4% edge vs <3% for UP (Synth is systematically
+    # bearish). Scanning UP wastes 50% of the Synth API budget. Default: both.
+    # Set SCAN_SIDES=DOWN to skip UP evaluation entirely.
+    scan_sides: List[str] = field(default_factory=lambda: [
+        s.strip().upper() for s in (_env("SCAN_SIDES", "UP,DOWN") or "").split(",") if s.strip()
+    ])
 
     # --- API spend controls ---
     synth_cache_enabled: bool = field(default_factory=lambda: _env_bool("SYNTH_CACHE_ENABLED", True))
@@ -193,12 +200,20 @@ class Config:
     # Captures the risk-premium effect: participants discount high-prob near-expiry contracts.
     # 0.0 = disabled (default). Late-window profile: 0.75.
     min_entry_price: float = field(default_factory=lambda: _env_float("MIN_ENTRY_PRICE", 0.0))
+    # Contrarian gate: only buy contracts the market prices BELOW this threshold.
+    # Forces entry on underdog positions where Synth disagrees with the crowd.
+    # inf = disabled (default). Contrarian profile: 0.35.
+    max_entry_price: float = field(default_factory=lambda: _env_float("MAX_ENTRY_PRICE", float("inf")))
 
     # --- Exit rules ---
     # Strategy B: only TIME_STOP (30s before resolution) and MODEL_REVERSAL fire.
     # SYNTH_EV_COLLAPSE is handled in evaluate_synth_updates().
     # EDGE_COLLAPSE and RANK_DECAY are disabled — market repricing toward Synth confirms the bet.
     time_stop_seconds: float = field(default_factory=lambda: _env_float("TIME_STOP_SECONDS", 30.0))
+    # RL exit policy: when Synth drops a market (STALE_DATA) and Gamma hasn't resolved it yet,
+    # hold the position if the market has at least this many seconds remaining. The calibrated
+    # entry probability already gives positive EV vs. exiting at a depressed stale bid.
+    stale_hold_min_secs: float = field(default_factory=lambda: _env_float("STALE_HOLD_MIN_SECS", 60.0))
     # If a Synth P update causes position EV to fall to or below this level, exit immediately.
     min_ev_to_hold: float = field(default_factory=lambda: _env_float("MIN_EV_TO_HOLD", 0.00))
     # Order execution style: "taker" = aggressive fill (guaranteed, higher fee);
@@ -232,9 +247,11 @@ class Config:
 
 PAPER_PROFILE: Dict[str, Any] = {
     # Strategy B paper trading: taker fills, high conviction threshold, hold to resolution.
+    # DOWN-only: UP signals have <3% qualifying rate vs 30-42% for DOWN (Synth bearish bias).
+    # min_liquidity lowered to 15 for paper test data collection (real money would use 100+).
     "min_entry_edge": 0.08,
     "min_synth_conviction": 0.68,
-    "min_liquidity": 50.0,
+    "min_liquidity": 15.0,
     "bankroll_usd": 1000.0,
     "max_position_size": 0.05,
     "execution_mode": "taker",
@@ -246,6 +263,7 @@ PAPER_PROFILE: Dict[str, Any] = {
     "max_entry_age_15m_sec": 750.0,
     "model_confidence_floor": 0.65,
     "calibration_shrinkage_k": 50.0,
+    "scan_sides": ["DOWN"],
 }
 
 LIVE_SAFE_PROFILE: Dict[str, Any] = {
@@ -289,10 +307,32 @@ LATE_WINDOW_PROFILE: Dict[str, Any] = {
     "calibration_shrinkage_k": 50.0,
 }
 
+CONTRARIAN_PROFILE: Dict[str, Any] = {
+    # Contrarian strategy: buy market underdogs when Synth strongly disagrees.
+    # Entry: market prices contract at ≤35¢, Synth says ≥65% for that side.
+    # Payoff asymmetry: win 65¢+ when right, lose 35¢ when wrong → breakeven ~35%.
+    # DOWN-only: Synth is systematically bearish (75-77% of samples UP_prob < 0.5).
+    # All high-conviction qualifying signals are naturally below 35¢ ask — no UP edge.
+    "min_entry_edge": 0.04,
+    "min_synth_conviction": 0.65,
+    "max_entry_price": 0.35,
+    "min_liquidity": 10.0,
+    "execution_mode": "taker",
+    "one_position_per_market": True,
+    "allow_reentry_after_exit": False,
+    "time_stop_seconds": 30.0,
+    "min_seconds_to_enter": 90.0,
+    "max_entry_age_15m_sec": 750.0,
+    "model_confidence_floor": 0.65,
+    "calibration_shrinkage_k": 50.0,
+    "scan_sides": ["DOWN"],
+}
+
 _PROFILES: Dict[str, Dict[str, Any]] = {
     "paper": PAPER_PROFILE,
     "live_safe": LIVE_SAFE_PROFILE,
     "late_window": LATE_WINDOW_PROFILE,
+    "contrarian": CONTRARIAN_PROFILE,
 }
 
 

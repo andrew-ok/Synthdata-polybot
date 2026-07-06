@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 import time
@@ -63,6 +64,26 @@ def _cancel_pending_on_restart() -> int:
     if pending:
         logging.getLogger("scanner").info("Cancelled %d stale PENDING orders on restart", len(pending))
     return len(pending)
+
+
+def _next_event_time_sleep(synth_lag_sec: int = 120, min_sleep_sec: int = 30) -> float:
+    """Return seconds to sleep until the next 15M window opens + Synth lag.
+
+    15M windows open every 900s at fixed UTC timestamps (:00, :15, :30, :45).
+    Synth takes ~2 minutes to post fresh data after each window open.
+    This ensures we scan within the first 90-120s of each window — the period
+    when Synth edge is freshest and the market hasn't fully repriced yet.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    window = 900  # 15-minute windows
+    last_open = math.floor(now / window) * window
+    synth_ready = last_open + synth_lag_sec
+    if synth_ready > now + min_sleep_sec:
+        # Synth is still processing this window's data — scan after lag
+        return synth_ready - now
+    # Already past Synth lag for this window; wait for the next window
+    next_open = last_open + window
+    return max(min_sleep_sec, next_open + synth_lag_sec - now)
 
 
 def run_scan(execute: bool, show_skipped: bool, limit: int, kelly: bool) -> int:
@@ -242,6 +263,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Print a dry-run strategy health report: config, exposure, recent signals, exits")
     p.add_argument("--loop", action="store_true",
                    help="Run continuously until Ctrl-C")
+    p.add_argument("--startup-delay", type=int, default=0, metavar="SECS",
+                   help="Sleep this many seconds before the first scan. Use to stagger "
+                        "two scanners so their Synth API calls don't collide (avoids 429s).")
+    p.add_argument("--event-time", action="store_true",
+                   help="Align scans to 15M window opens (+120s Synth lag) instead of fixed interval. "
+                        "Ensures fresh signals on every 15M window rather than random-phase polling.")
     p.add_argument("--interval-seconds", type=int, default=360,
                    help="Seconds between scans when --loop is used (default 360 / 6 min). "
                         "Synth forecasts refresh every 3 min; 6 min captures every other update. "
@@ -260,9 +287,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         _setup_logging(args.verbose)
         log = logging.getLogger("scanner")
-        log.info("Starting paper trading loop: interval=%ds profile=%s", interval, args.profile or "none")
+        event_time = getattr(args, "event_time", False)
+        mode_str = "event-time (15M windows)" if event_time else f"fixed interval={interval}s"
+        log.info("Starting paper trading loop: mode=%s profile=%s", mode_str, args.profile or "none")
         if args.profile:
             apply_profile(CONFIG, args.profile)
+        from .calibration import Calibrator
+        cal = Calibrator()
+        log.info("Calibration mode: %s  scan_sides=%s", cal.calibration_mode, CONFIG.scan_sides)
+        if getattr(args, "startup_delay", 0) > 0:
+            log.info("Startup delay: sleeping %ds to stagger Synth API calls", args.startup_delay)
+            time.sleep(args.startup_delay)
         n_cancelled = _cancel_pending_on_restart()
         if n_cancelled:
             log.info("Restart: cancelled %d stale pending orders", n_cancelled)
@@ -279,7 +314,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as exc:
                 log.error("Scan error: %s", exc, exc_info=True)
             try:
-                time.sleep(interval)
+                if event_time:
+                    sleep_sec = _next_event_time_sleep()
+                    log.info("Event-time sleep: %.0fs until next 15M window + Synth lag", sleep_sec)
+                    time.sleep(sleep_sec)
+                else:
+                    time.sleep(interval)
             except KeyboardInterrupt:
                 log.info("Paper trader stopped during sleep.")
                 break

@@ -253,32 +253,33 @@ def evaluate(
                 continue
 
         # --- Up leg ---
-        yes_bid = opp.yes_bid_price if opp.yes_bid_price is not None else opp.best_bid_price
-        yes_ask = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
-        yes_spread = _spread(yes_bid, yes_ask)
-        yes_liq = (opp.yes_ask_size or opp.best_ask_size) * (yes_ask or 0.0)
-        if yes_bid is not None and (yes_ask is not None or is_maker):
-            cal = calibrator.calibrate_side(opp.asset, opp.horizon, "UP", opp.synth_probability_up)
-            if is_maker and yes_bid is not None:
-                # Post limit order just above best bid; cap below ask to remain non-crossing.
-                maker_px = yes_bid + maker_offset
-                if yes_ask is not None:
-                    maker_px = min(maker_px, yes_ask - 0.001)
-                maker_px = round(min(0.999, max(0.001, maker_px)), 4)
-                sig = _signal(opp, "UP", maker_px, yes_bid, yes_spread, yes_liq,
-                              opp.synth_probability_up, cal, thr, "maker_yes_clob", "real_clob",
-                              is_maker=True)
+        if "UP" in CONFIG.scan_sides:
+            yes_bid = opp.yes_bid_price if opp.yes_bid_price is not None else opp.best_bid_price
+            yes_ask = opp.yes_ask_price if opp.yes_ask_price is not None else opp.best_ask_price
+            yes_spread = _spread(yes_bid, yes_ask)
+            yes_liq = (opp.yes_ask_size or opp.best_ask_size) * (yes_ask or 0.0)
+            if yes_bid is not None and (yes_ask is not None or is_maker):
+                cal = calibrator.calibrate_side(opp.asset, opp.horizon, "UP", opp.synth_probability_up)
+                if is_maker and yes_bid is not None:
+                    # Post limit order just above best bid; cap below ask to remain non-crossing.
+                    maker_px = yes_bid + maker_offset
+                    if yes_ask is not None:
+                        maker_px = min(maker_px, yes_ask - 0.001)
+                    maker_px = round(min(0.999, max(0.001, maker_px)), 4)
+                    sig = _signal(opp, "UP", maker_px, yes_bid, yes_spread, yes_liq,
+                                  opp.synth_probability_up, cal, thr, "maker_yes_clob", "real_clob",
+                                  is_maker=True)
+                    if sig:
+                        sig = _apply_fill_model(sig, fill_model, yes_ask, maker_px)
+                else:
+                    sig = _signal(opp, "UP", yes_ask, yes_bid, yes_spread, yes_liq,
+                                  opp.synth_probability_up, cal, thr, "real_yes_clob", "real_clob")
                 if sig:
-                    sig = _apply_fill_model(sig, fill_model, yes_ask, maker_px)
-            else:
-                sig = _signal(opp, "UP", yes_ask, yes_bid, yes_spread, yes_liq,
-                              opp.synth_probability_up, cal, thr, "real_yes_clob", "real_clob")
-            if sig:
-                signals.append(sig)
-        elif CONFIG.require_real_two_sided_clob:
-            pass
+                    signals.append(sig)
 
         # --- Down leg (real CLOB book if available; otherwise complementary book) ---
+        if "DOWN" not in CONFIG.scan_sides:
+            continue
         if opp.no_ask_price is not None:
             ask_down = opp.no_ask_price
             bid_down = opp.no_bid_price or 0.0

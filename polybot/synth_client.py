@@ -115,7 +115,7 @@ def _write_cache(path: str, params: Optional[Dict[str, Any]], data: Dict[str, An
         return
     cache_file = _cache_path(path, params)
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    tmp = cache_file + ".tmp"
+    tmp = cache_file + f".tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, sort_keys=True)
     os.replace(tmp, cache_file)
